@@ -1,0 +1,33 @@
+#!/usr/bin/python3
+"""hq-caddy: entrypoint of the hq-caddy image.
+
+Stage 1 (image only): `run` starts Caddy with a mounted Caddyfile. The config
+generator (git sync, sites page, status checks, DNS helpers) replaces this in
+the next stage.
+
+Commands:
+  run        run Caddy in the foreground with $HQ_CADDYFILE (default /etc/caddy/Caddyfile)
+  --version  print the hq-caddy and Caddy versions
+"""
+import os
+import subprocess
+import sys
+
+VERSION = "0.1.0"
+
+
+def main(args):
+    command = args[0] if args else "run"
+    if command in ("--version", "version"):
+        caddy = subprocess.run(["caddy", "version"], capture_output=True, text=True).stdout.split()
+        print(f"hq-caddy {VERSION} (caddy {caddy[0] if caddy else 'unknown'})")
+        return 0
+    if command == "run":
+        caddyfile = os.environ.get("HQ_CADDYFILE", "/etc/caddy/Caddyfile")
+        os.execvp("caddy", ["caddy", "run", "--config", caddyfile, "--adapter", "caddyfile"])
+    print(__doc__.strip())
+    return 0 if command in ("-h", "--help", "help") else 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
