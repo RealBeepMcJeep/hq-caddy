@@ -1,0 +1,214 @@
+# Probe upstream versions every 6 hours; build, self-test and publish the image
+# only when something changed. The repo is pushed here by a one-way Gitea push
+# mirror, so this workflow never writes to the repository.
+#
+# "Changed" = the hash of scripts/probe-versions.sh output plus every tracked
+# build input (Dockerfile, rootfs/, .dockerignore, the probe script and this
+# workflow) differs from the fingerprint label on :latest.
+#
+# Tags: :latest, :YYYYMMDD-HHMMSS and :sha-<commit>. Roll back with dated tags.
+# Images are multi-arch (linux/amd64, linux/arm64). Nothing is pushed unless the
+# self-test passes; pushes to other branches build and test but never publish.
+name: Build image
+
+on:
+  push:
+    branches: ["**"]
+  schedule:
+    - cron: "47 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even if nothing changed
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+  actions: write # re-enable this workflow so the schedule never lapses
+
+concurrency:
+  group: build-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      build: ${{ steps.decide.outputs.build }}
+      publish: ${{ steps.decide.outputs.publish }}
+      image: ${{ steps.decide.outputs.image }}
+      fingerprint: ${{ steps.decide.outputs.fingerprint }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # GitHub disables scheduled workflows after 60 days without repository
+      # activity; re-enabling through the API resets that without a commit.
+      - name: Keep the schedule alive
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/build.yml/enable"
+
+      - name: Probe upstream versions
+        run: bash scripts/probe-versions.sh | tee versions.env
+
+      - name: Compare with the published image
+        id: decide
+        env:
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${GITHUB_REPOSITORY#*/}"
+          fingerprint="$( { cat versions.env; git ls-files -s Dockerfile rootfs .dockerignore \
+            scripts/probe-versions.sh .github/workflows/build.yml; } | sha256sum | cut -d' ' -f1)"
+          labels="$(skopeo inspect --creds "${{ github.actor }}:${{ github.token }}" \
+            --format '{{json .Labels}}' "docker://$image:latest" 2>/dev/null || echo '{}')"
+          published="$(jq -r '."io.hq-caddy.fingerprint" // ""' <<< "$labels")"
+          jq -r '."io.hq-caddy.inputs" // ""' <<< "$labels" | tr ' ' '\n' | sed '/^$/d' > published.env
+
+          build=true
+          publish=true
+          if [ "$GITHUB_REF" != refs/heads/main ]; then
+            publish=false # branch/PR validation: always build and test, never publish
+          elif [ "$published" = "$fingerprint" ] && [ "$FORCE" != true ]; then
+            build=false
+          fi
+          {
+            echo "image=$image"
+            echo "fingerprint=$fingerprint"
+            echo "build=$build"
+            echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
+          {
+            if [ "$publish" = false ]; then echo "### Branch build: test only, nothing will be published"
+            elif [ "$build" = true ]; then echo "### Building a new image"
+            else echo "### Up to date: nothing to build"; fi
+            echo '```diff'
+            diff -u published.env versions.env | tail -n +3 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: versions
+          path: versions.env
+
+  build:
+    needs: probe
+    if: needs.probe.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      IMAGE: ${{ needs.probe.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: versions
+
+      - name: Build arguments
+        id: args
+        run: |
+          {
+            echo 'list<<EOF'
+            cat versions.env
+            echo "BUILD_INPUTS=$(tr '\n' ' ' < versions.env)"
+            echo EOF
+            echo "inputs=$(tr '\n' ' ' < versions.env)"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v4
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value={{date 'YYYYMMDD-HHmmss'}}
+            type=sha,format=short,prefix=sha-
+          labels: |
+            io.hq-caddy.fingerprint=${{ needs.probe.outputs.fingerprint }}
+            io.hq-caddy.inputs=${{ steps.args.outputs.inputs }}
+
+      # amd64 into the local engine first, for the self-test.
+      - name: Build (amd64, for the self-test)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          provenance: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: ${{ steps.args.outputs.list }}
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max
+
+      # An HTTP site and a layer4 TCP forward to it, through the built image.
+      - name: Self-test
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/selftest
+          cat > /tmp/selftest/Caddyfile <<'EOF'
+          {
+            admin off
+            layer4 {
+              :18022 {
+                route {
+                  proxy 127.0.0.1:18080
+                }
+              }
+            }
+          }
+          http://:18080 {
+            respond "hq-caddy-ok"
+          }
+          EOF
+          docker run --rm "$IMAGE:latest" --version
+          docker run -d --name selftest --network host -e HQ_CADDYFILE=/etc/selftest/Caddyfile \
+            -v /tmp/selftest:/etc/selftest:ro "$IMAGE:latest"
+          for _ in $(seq 1 20); do curl -fsS http://127.0.0.1:18080/ > /dev/null 2>&1 && break; sleep 1; done
+          [ "$(curl -fsS http://127.0.0.1:18080/)" = hq-caddy-ok ] || { echo "::error::HTTP site failed"; docker logs selftest; exit 1; }
+          [ "$(curl -fsS http://127.0.0.1:18022/)" = hq-caddy-ok ] || { echo "::error::layer4 forward failed"; docker logs selftest; exit 1; }
+          docker stop -t 10 selftest
+
+      # Every platform: the arm64 build runs the module check under emulation.
+      # Pushes only from main (publish), after the self-test above.
+      - name: Build all platforms${{ needs.probe.outputs.publish == 'true' && ' and publish' || '' }}
+        id: push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ needs.probe.outputs.publish == 'true' }}
+          provenance: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: ${{ steps.args.outputs.list }}
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
+
+      - name: Summary
+        if: needs.probe.outputs.publish == 'true'
+        run: |
+          {
+            echo "### Published"
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo "digest: ${{ steps.push.outputs.digest }}"
+            echo '```'
+            echo '```'
+            cat versions.env
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
