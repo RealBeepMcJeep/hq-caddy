@@ -181,22 +181,26 @@ jobs:
             -e HQ_CONFIG_REPO=file:///config.git -v "$T/config.git:/config.git" -v "$T/data:/data" "$IMAGE:latest"
           get() { curl -sk -o /dev/null -w '%{http_code}' --resolve "$1.example.test:18443:127.0.0.1" "https://$1.example.test:18443$2"; }
           wait_for() { for _ in $(seq 1 40); do eval "$1" && return 0; sleep 1; done; echo "timed out: $1"; return 1; }
+          # Capture first, then grep: `cmd | grep -q` fails under pipefail when grep
+          # exits at the first match while cmd is still writing (SIGPIPE).
+          status_has() { local out; out="$(docker exec hq hq-caddy status 2>&1 || true)"; grep -q "$1" <<< "$out"; }
+          page_has() { local out; out="$(curl -sk --resolve sites.example.test:18443:127.0.0.1 https://sites.example.test:18443/ || true)"; grep -q "$1" <<< "$out"; }
           wait_for '[ "$(get upstream /marker.txt)" = 200 ]'
           [ "$(get sites /)" = 200 ]
           [ "$(get hello.demo /marker.txt)" = 200 ]
           [ "$(get nothing.demo /)" = 404 ]
           [ "$(get no-such-site /)" = 404 ]
           [ "$(curl -s -m 5 http://127.0.0.1:18022/marker.txt)" = upstream-ok ]
-          docker exec hq hq-caddy status | grep -q 'applied: .* first sites'
+          status_has 'applied: .* first sites'
           # A broken commit is rejected with the file named; the old config keeps serving.
           printf 'import site bad {\n\treverse_proxy 127.0.0.1:1\n' > "$T/work/sites/bad.caddy"; commit "broken site"
-          wait_for 'docker exec hq hq-caddy status | grep -q "REJECTED: .*sites/bad.caddy: unbalanced braces"'
+          wait_for 'status_has "REJECTED: .*sites/bad.caddy: unbalanced braces"'
           [ "$(get upstream /marker.txt)" = 200 ]
-          curl -sk --resolve sites.example.test:18443:127.0.0.1 https://sites.example.test:18443/ | grep -q 'was rejected'
+          page_has 'was rejected'
           # The fix applies and clears the banner.
           rm "$T/work/sites/bad.caddy"; printf 'import proxy second 127.0.0.1:18999\n' > "$T/work/sites/second.caddy"; commit "fix"
           wait_for '[ "$(get second /marker.txt)" = 200 ]'
-          if curl -sk --resolve sites.example.test:18443:127.0.0.1 https://sites.example.test:18443/ | grep -q 'was rejected'; then
+          if page_has 'was rejected'; then
             echo "the rejection banner is still shown after the fix"; false
           fi
           # Status checks (the first round runs 15 s after start).
