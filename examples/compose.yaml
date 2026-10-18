@@ -1,0 +1,38 @@
+# Example stack for hq-caddy. Replace every example value; nothing here is real.
+services:
+  hq-caddy:
+    image: ghcr.io/realbeepmcjeep/hq-caddy:latest   # or pin a dated tag
+    container_name: hq-caddy
+    restart: unless-stopped
+    environment:
+      PROXY_DOMAIN: example.com
+      PROXY_BIND: 192.0.2.10                       # the proxy's own LAN address
+      HQ_CONFIG_REPO: https://git.example.com/you/proxy-config.git
+      HQ_CONFIG_USER: hq-caddy
+      HQ_CONFIG_TOKEN_FILE: /run/secrets/git_token
+      CLOUDFLARE_API_TOKEN_FILE: /run/secrets/cloudflare_token
+      PROXY_MANAGE_DNS: "true"
+      TZ: Etc/UTC
+    secrets:
+      - git_token
+      - cloudflare_token
+    volumes:
+      - hq-caddy-data:/data
+    # A dedicated LAN address, so ports 80/443 (and TCP forwards like 22) don't
+    # collide with the host. A plain bridge with published ports works too.
+    networks:
+      lan:
+        ipv4_address: 192.0.2.10
+
+secrets:
+  git_token:
+    file: ./secrets/git_token
+  cloudflare_token:
+    file: ./secrets/cloudflare_token
+
+volumes:
+  hq-caddy-data:
+
+networks:
+  lan:
+    external: true   # e.g. a macvlan network on the host's LAN interface
