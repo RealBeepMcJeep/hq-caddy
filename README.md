@@ -20,6 +20,9 @@ rebuilt by GitHub Actions only when an upstream version changes (see
 
 ## Status
 
-Stage 1: the image. `hq-caddy run` starts Caddy with the Caddyfile at
-`$HQ_CADDYFILE` (default `/etc/caddy/Caddyfile`). Certificates and state live
-in `/data`, so mount a volume there.
+Stage 2: the generator. `hq-caddy run` (the default command) pulls site files
+from a Git repository (`HQ_CONFIG_REPO`, or a mounted `HQ_CONFIG_DIR`), validates
+every new commit before reloading Caddy, reports the result as a commit status,
+and serves `https://sites.<domain>` with status checks. `hq-caddy --help` lists
+every setting and command; full documentation follows. Certificates and state
+live in `/data`, so mount a volume there.

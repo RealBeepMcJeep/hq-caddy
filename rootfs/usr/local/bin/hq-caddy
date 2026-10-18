@@ -1,33 +1,1192 @@
 #!/usr/bin/python3
-"""hq-caddy: entrypoint of the hq-caddy image.
+"""hq-caddy: a standalone Caddy proxy whose site files come from a Git repository.
 
-Stage 1 (image only): `run` starts Caddy with a mounted Caddyfile. The config
-generator (git sync, sites page, status checks, DNS helpers) replaces this in
-the next stage.
+Every HQ_POLL_SECONDS it fetches the config repository, builds a complete Caddy
+configuration from its sites/ and tcp/ files, validates it, and reloads Caddy.
+An invalid commit is never applied: the running configuration stays, and the
+commit gets a failed status (Gitea API) plus a banner on the sites page.
+
+Settings (environment):
+  PROXY_DOMAIN               the domain: https://<name>.<domain>, with a Let's
+                             Encrypt wildcard certificate via Cloudflare DNS-01
+  CLOUDFLARE_API_TOKEN       Cloudflare token (Zone DNS edit), or
+  CLOUDFLARE_API_TOKEN_FILE  a file holding it
+  HQ_CONFIG_REPO             Git URL of the config repository (https:// or file://)
+  HQ_CONFIG_BRANCH           branch to follow (default main)
+  HQ_CONFIG_USER             username for HTTPS fetches (default hq-caddy)
+  HQ_CONFIG_TOKEN_FILE       token for HTTPS fetches and commit statuses
+  HQ_CONFIG_DIR              instead of a repository: a mounted folder, re-read on change
+  HQ_POLL_SECONDS            seconds between fetches (default 30, min 5)
+  HQ_STATUS_CONTEXT          name of the commit status (default hq-caddy)
+  HQ_TLS                     "internal": certificates from Caddy's local CA (tests)
+  PROXY_BIND                 addresses to listen on, comma/space separated (default all)
+  PROXY_HTTP_PORT/PROXY_HTTPS_PORT  listener ports (default 80/443)
+  PROXY_MANAGE_DNS           true: create missing *.<host>.<domain> A records for
+                             <service>.<host> sites (create-only)
+  PROXY_DNS_TARGET           address for those records (default: first IPv4 PROXY_BIND)
+  PROXY_CHECK_INTERVAL       seconds between status checks of one site (default 300, min 60)
+
+Config repository layout:
+  sites/<name>.caddy   one site: `import proxy <name> <upstream>` or
+                       `import site <name> { ... }` with any Caddy directives
+  tcp/<name>.caddy     raw TCP: `import forward <port> <upstream>`
+  A `# check: ...` line in a file defines its status check (see the README).
 
 Commands:
-  run        run Caddy in the foreground with $HQ_CADDYFILE (default /etc/caddy/Caddyfile)
+  run        build and run Caddy, the sync loop and the status checks (the default)
+  status     the applied commit, the last sync result and Caddy's state
+  show       print the active Caddy configuration
+  checks     list every status check result
+  sync       fetch and apply now instead of waiting for the next poll
+  check DIR  build and validate DIR (a checkout of the config repository) without applying
   --version  print the hq-caddy and Caddy versions
 """
+import base64
+import hashlib
+import html
+import ipaddress
+import json
 import os
+import re
+import shutil
+import signal
+import socket
 import subprocess
 import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
+STATE = Path(os.environ.get("HQ_STATE_DIR", "/data/hq-caddy"))
+ACTIVE = STATE / "active"
+CANDIDATE = STATE / "candidate"
+REPO = STATE / "repo"
+LOG = STATE / "caddy.log"
+REPORT = STATE / "report.json"
+STATUS = STATE / "status.json"
+DNS_LIST = STATE / "dns.json"
+SYNC = STATE / "sync.json"
+SYNC_NOW = STATE / "sync-now"
+ADMIN = os.environ.get("HQ_ADMIN", "localhost:2019")  # Caddy admin API, inside the container only
+RESERVED = {"sites"}
+NAME = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$")
+CHECK_LINE = re.compile(r"^\s*#\s*check:\s*(.*?)\s*$", re.M)
+CHECK_TIMEOUT = 10  # seconds per check
+DOMAIN = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$")
 
 
-def main(args):
-    command = args[0] if args else "run"
-    if command in ("--version", "version"):
-        caddy = subprocess.run(["caddy", "version"], capture_output=True, text=True).stdout.split()
-        print(f"hq-caddy {VERSION} (caddy {caddy[0] if caddy else 'unknown'})")
-        return 0
-    if command == "run":
-        caddyfile = os.environ.get("HQ_CADDYFILE", "/etc/caddy/Caddyfile")
-        os.execvp("caddy", ["caddy", "run", "--config", caddyfile, "--adapter", "caddyfile"])
-    print(__doc__.strip())
-    return 0 if command in ("-h", "--help", "help") else 2
+def env(name, default=""):
+    return os.environ.get(name, default).strip()
 
+
+def number(name, default, minimum):
+    value = env(name, str(default))
+    return max(minimum, int(value)) if value.isdigit() else default
+
+
+def settings():
+    public = env("PROXY_DOMAIN").lower().rstrip(".")
+    bind = [a for a in re.split(r"[,\s]+", env("PROXY_BIND")) if a]
+    return {
+        "public": public if DOMAIN.match(public) else "",
+        "tls_internal": env("HQ_TLS").lower() == "internal",
+        "bind": bind,
+        "http_port": env("PROXY_HTTP_PORT", "80"),
+        "https_port": env("PROXY_HTTPS_PORT", "443"),
+        "repo": env("HQ_CONFIG_REPO"),
+        "branch": env("HQ_CONFIG_BRANCH", "main"),
+        "user": env("HQ_CONFIG_USER", "hq-caddy"),
+        "repo_token_file": env("HQ_CONFIG_TOKEN_FILE"),
+        "config_dir": env("HQ_CONFIG_DIR"),
+        "poll": number("HQ_POLL_SECONDS", 30, 5),
+        "check_interval": number("PROXY_CHECK_INTERVAL", 300, 60),
+        "manage_dns": env("PROXY_MANAGE_DNS").lower() in ("1", "true", "yes", "on"),
+        "dns_target": env("PROXY_DNS_TARGET") or next((a for a in bind if re.fullmatch(r"[0-9.]+", a)), ""),
+    }
+
+
+def read_secret(variable, file_variable):
+    if env(variable):
+        return env(variable)
+    try:
+        return Path(env(file_variable)).read_text().strip() if env(file_variable) else ""
+    except OSError:
+        return ""
+
+
+def token():
+    return read_secret("CLOUDFLARE_API_TOKEN", "CLOUDFLARE_API_TOKEN_FILE")
+
+
+def caddy_env():
+    """Environment for Caddy: the token is passed by variable, never written to config."""
+    environment = dict(os.environ)
+    if token():
+        environment["CLOUDFLARE_API_TOKEN"] = token()
+    return environment
+
+
+def log(message):
+    print(f"hq-caddy: {message}", file=sys.stderr, flush=True)
+
+
+# ----- site files ---------------------------------------------------------------
+
+def collect(source):
+    """Site and tcp files in a config checkout; names that can't be served are skipped."""
+    sites, skipped, tcp = [], [], []
+    for path in sorted((source / "sites").glob("*.caddy")) if (source / "sites").is_dir() else []:
+        name, entry = path.stem, {"name": path.stem, "source": f"sites/{path.name}", "path": str(path)}
+        if name in RESERVED:
+            skipped.append(dict(entry, reason="reserved name"))
+        elif not NAME.match(name):
+            skipped.append(dict(entry, reason="invalid name (a-z, 0-9, -, dots between labels)"))
+        else:
+            sites.append(dict(entry, check=check_line(path)))
+    for path in sorted((source / "tcp").glob("*.caddy")) if (source / "tcp").is_dir() else []:
+        tcp.append({"name": path.stem, "source": f"tcp/{path.name}", "path": str(path),
+                    "ports": forward_ports(path), "check": check_line(path)})
+    return sites, skipped, tcp
+
+
+def check_line(path):
+    """The status check defined by a `# check: ...` line ("" when there is none)."""
+    try:
+        found = CHECK_LINE.search(Path(path).read_text())
+    except OSError:
+        return ""
+    return found.group(1) if found else ""
+
+
+def forward_ports(path):
+    """Ports named by `import forward PORT UPSTREAM` lines (for listings only)."""
+    try:
+        return [f"{m.group(1)} -> {m.group(2)}" for m in
+                re.finditer(r"^\s*import\s+forward\s+(\d+)\s+(\S+)", path.read_text(), re.M)]
+    except OSError:
+        return []
+
+
+def cloudflare(method, path, data=None):
+    req = urllib.request.Request("https://api.cloudflare.com/client/v4" + path, method=method,
+                                 data=json.dumps(data).encode() if data is not None else None,
+                                 headers={"Authorization": f"Bearer {token()}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as error:
+        return json.load(error)
+
+
+def zone_id(cfg):
+    """Cloudflare zone of PROXY_DOMAIN; the zone may be a parent of it."""
+    labels = cfg["public"].split(".")
+    for i in range(len(labels) - 1):
+        found = cloudflare("GET", "/zones?name=" + ".".join(labels[i:])).get("result") or []
+        if found:
+            return found[0]["id"]
+    return None
+
+
+def ensure_dns(cfg, names):
+    """Create missing *.<host>.<domain> A records. Create-only; returns per-host results."""
+    if not (cfg["manage_dns"] and cfg["public"] and names):
+        return []
+    if not cfg["dns_target"]:
+        return [{"name": "*", "state": "error: set PROXY_DNS_TARGET (or an IPv4 PROXY_BIND)"}]
+    results = []
+    try:
+        zone = zone_id(cfg)
+        if not zone:
+            return [{"name": "*", "state": f"error: no Cloudflare zone found for {cfg['public']}"}]
+        for host in names:
+            fqdn = f"*.{host}.{cfg['public']}"
+            existing = cloudflare("GET", f"/zones/{zone}/dns_records?name={fqdn}").get("result") or []
+            if existing:
+                results.append({"name": fqdn, "state": "exists"})
+                continue
+            made = cloudflare("POST", f"/zones/{zone}/dns_records", {
+                "type": "A", "name": fqdn, "content": cfg["dns_target"], "proxied": False, "ttl": 1,
+                "comment": f"hq-caddy: services on {host} (<service>.{host}.{cfg['public']})"})
+            state = "created" if made.get("success") else "error: " + "; ".join(
+                e.get("message", "?") for e in made.get("errors", []))
+            results.append({"name": fqdn, "state": state})
+    except (OSError, ValueError) as error:
+        results.append({"name": "*", "state": f"error: {type(error).__name__}"})
+    return results
+# ----- configuration ---------------------------------------------------------
+
+def quote(value):
+    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def dns_hosts(cfg):
+    """Hosts with a *.<host>.<domain> record pointing here: their names get the 404 page
+    (and a certificate) even when no site file uses that host."""
+    here = set(cfg["bind"]) | {cfg["dns_target"]}
+    suffix = "." + cfg["public"]
+    found = set()
+    for record in load_json(DNS_LIST).get("records", []):
+        name = record["name"]
+        if name.startswith("*.") and name.endswith(suffix) and record["address"] in here:
+            host = name[2:-len(suffix)]
+            if host and DOMAIN.match(host):
+                found.add(host)
+    return found
+
+
+def caddyfile(cfg, sites, tcp, host_names, target):
+    public = cfg["public"]
+    index = target / "pages"
+    # (forward PORT UPSTREAM) for tcp/ files: raw TCP on every bind address.
+    # Snippets used inside global options must be defined before that block.
+    listen = [f"[{a}]" if ":" in a and not a.startswith("[") else a for a in cfg["bind"]] or [""]
+    out = ["# import forward PORT UPSTREAM (in tcp/*.caddy)", "(forward) {",
+           "\t" + " ".join(f"{a}:{{args[0]}}" for a in listen) + " {",
+           "\t\troute {", "\t\t\tproxy {args[1]}", "\t\t}", "\t}", "}", ""]
+    out += ["{", f"\tadmin {ADMIN}", "\tskip_install_trust", "\tgrace_period 10s",
+            f"\thttp_port {cfg['http_port']}", f"\thttps_port {cfg['https_port']}"]
+    if cfg["bind"]:
+        out.append("\tdefault_bind " + " ".join(cfg["bind"]))
+    if cfg["tls_internal"]:
+        out.append("\tlocal_certs")
+    elif token():
+        out.append("\tacme_dns cloudflare {env.CLOUDFLARE_API_TOKEN}")
+    if tcp:
+        out.append("\tlayer4 {")
+        out += [f"\t\timport {quote(item['path'])}" for item in tcp]
+        out.append("\t}")
+    out += ["\tlog default {", "\t\toutput stderr", "\t\tformat console", "\t}",
+            "\tlog file {", f"\t\toutput file {quote(LOG)} {{", "\t\t\troll_size 5MiB", "\t\t\troll_keep 3",
+            "\t\t}", "\t\tformat json", "\t}", "}", ""]
+
+    # (site NAME { directives }) and (proxy NAME UPSTREAM), as in site files.
+    out += ["(site) {", f"\t{{args[0]}}.{public} {{", "\t\t{block}", "\t}", "}", "",
+            "# import proxy NAME UPSTREAM", "(proxy) {", "\timport site {args[0]} {",
+            "\t\treverse_proxy {args[1]}", "\t}", "}", ""]
+
+    # The sites page, the unknown-name page and HTTP->HTTPS redirects.
+    out += ["import site sites {"]
+    for name in ("status.json", "dns.json", "sync.json"):
+        out += [f"\thandle /{name} {{", "\t\theader Cache-Control no-store",
+                f"\t\troot * {quote(STATE)}", "\t\tfile_server", "\t}"]
+    out += ["\thandle {", f"\t\troot * {quote(index)}", "\t\tfile_server", "\t}", "}", ""]
+    unknown = ["\troot * " + quote(index), "\trewrite * /404.html", "\tfile_server {", "\t\tstatus 404", "\t}"]
+    # One wildcard per host: a single certificate covers every service on that host
+    # (Caddy 2.10+ prefers an applicable wildcard).
+    for prefix in ["*"] + [f"*.{host}" for host in sorted(host_names)]:
+        out += [f"{prefix}.{public} {{"] + unknown + ["}", "",
+                f"http://{prefix}.{public} {{", "\tredir https://{host}{uri} permanent", "}", ""]
+    for item in sites:
+        out += [f"# {item['source']}", f"import {quote(item['path'])}", ""]
+    return "\n".join(out) + "\n"
+
+
+def urls(cfg, name):
+    return [f"https://{name}.{cfg['public']}"]
+
+
+def hosts(sites):
+    """Hosts named by <service>.<host> site files, e.g. dockge.nas -> nas."""
+    found = {item["name"].split(".", 1)[1] for item in sites if "." in item["name"]}
+    return sorted(h for h in found if DOMAIN.match(h))
+
+
+def build(target, cfg, source, sync):
+    """Write a complete configuration into target from a config checkout (its site and
+    tcp files are copied, so the running config never reads a newer checkout)."""
+    if target.exists():
+        shutil.rmtree(target)
+    for sub in ("sites", "tcp"):
+        (target / sub).mkdir(parents=True)
+        for path in sorted((source / sub).glob("*.caddy")) if (source / sub).is_dir() else []:
+            shutil.copy2(path, target / sub / path.name)
+    (target / "pages").mkdir()
+    sites, skipped, tcp = collect(target)
+    host_names = set(hosts(sites)) | dns_hosts(cfg)
+    (target / "Caddyfile").write_text(caddyfile(cfg, sites, tcp, host_names, target))
+    # Normalise formatting so Caddy does not warn about it on every start.
+    subprocess.run(["caddy", "fmt", "--overwrite", str(target / "Caddyfile")], capture_output=True)
+    for name, content in pages(cfg, sites, skipped, tcp, sync).items():
+        (target / "pages" / name).write_text(content)
+    active = lambda item: dict(item, path=item["path"].replace(str(target), str(ACTIVE), 1))
+    return {"public": cfg["public"], "hosts": sorted(host_names), "sites": [active(s) for s in sites],
+            "skipped": skipped, "tcp": [active(t) for t in tcp]}
+
+
+def caddy(*args):
+    return subprocess.run(["caddy", *args], env=caddy_env(), capture_output=True, text=True)
+
+
+def caddy_error(output, directory):
+    """The readable part of Caddy's error output, with paths relative to the config."""
+    message = output.strip()[-300:]
+    for line in reversed(output.splitlines()):
+        if line.startswith("Error:"):
+            message = line[6:].strip()
+            break
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict) and entry.get("level") == "error":
+            message = entry.get("error") or entry.get("msg") or message
+            break
+    return message.replace(str(directory) + "/", "")
+
+
+def validate(directory, caddy_file="Caddyfile"):
+    result = caddy("validate", "--config", str(directory / caddy_file), "--adapter", "caddyfile")
+    return result.returncode == 0, caddy_error(result.stderr or result.stdout, directory)
+
+
+def braces(text):
+    """Count { and } outside comments and quoted strings. Caddy accepts a file that ends
+    inside a block, but then it swallows whatever is imported after it."""
+    opened = closed = 0
+    for line in text.splitlines():
+        quoted = False
+        for char in line:
+            if char == '"':
+                quoted = not quoted
+            elif not quoted and char == "#":
+                break
+            elif not quoted:
+                opened += char == "{"
+                closed += char == "}"
+    return opened, closed
+
+
+def culprits(directory):
+    """Validate each site and tcp file on its own (the others left out) to name the broken ones."""
+    text = (directory / "Caddyfile").read_text()
+    files = [p for sub in ("sites", "tcp") for p in sorted((directory / sub).glob("*.caddy"))]
+    found = []
+    for path in files:
+        opened, closed = braces(path.read_text())
+        if opened != closed:
+            found.append(f"{path.relative_to(directory)}: unbalanced braces ({opened} '{{' vs {closed} '}}')")
+            continue
+        others = [f'import "{other}"' for other in files if other != path]
+        probe = "\n".join(line for line in text.splitlines() if line.strip() not in others) + "\n"
+        (directory / "probe.Caddyfile").write_text(probe)
+        ok, message = validate(directory, "probe.Caddyfile")
+        if not ok:
+            found.append(f"{path.relative_to(directory)}: {message}")
+    (directory / "probe.Caddyfile").unlink(missing_ok=True)
+    return found
+
+
+def running():
+    try:
+        with urllib.request.urlopen(f"http://{ADMIN}/config/", timeout=2):
+            return True
+    except OSError:
+        return False
+
+
+BUILD_LOCK = threading.Lock()
+
+
+def apply(cfg, source, sync):
+    """Build from source, validate, then make it the running config. On any failure the
+    previous configuration keeps running. Returns (ok, message)."""
+    with BUILD_LOCK:
+        report = build(CANDIDATE, cfg, source, sync)
+        dns = ensure_dns(cfg, hosts(report["sites"]))
+        for item in dns:
+            if item["state"].startswith("error") or item["state"] == "created":
+                log(f"DNS {item['name']}: {item['state']}")
+        ok, message = validate(CANDIDATE)
+        if not ok:
+            message = "; ".join(culprits(CANDIDATE)) or message
+            shutil.rmtree(CANDIDATE, ignore_errors=True)
+            return False, message
+        previous = STATE / "previous"
+        shutil.rmtree(previous, ignore_errors=True)
+        if ACTIVE.exists():
+            ACTIVE.rename(previous)
+        CANDIDATE.rename(ACTIVE)
+        caddy_file = ACTIVE / "Caddyfile"
+        caddy_file.write_text(caddy_file.read_text().replace(str(CANDIDATE), str(ACTIVE)))
+        if running():
+            result = caddy("reload", "--config", str(caddy_file), "--adapter", "caddyfile", "--address", ADMIN)
+            if result.returncode != 0:
+                # Caddy kept its old config: put the matching files back.
+                shutil.rmtree(ACTIVE, ignore_errors=True)
+                if previous.exists():
+                    previous.rename(ACTIVE)
+                return False, "reload failed: " + (result.stderr.strip().splitlines() or ["?"])[-1][-400:]
+        shutil.rmtree(previous, ignore_errors=True)
+        report["dns"] = dns
+        write_json(REPORT, report)
+        return True, ""
+
+
+def rebuild(cfg):
+    """Apply the active snapshot again (settings or DNS hosts changed)."""
+    return apply(cfg, ACTIVE if (ACTIVE / "Caddyfile").exists() else STATE / "empty", load_json(SYNC))
+
+
+# ----- sites page --------------------------------------------------------------
+
+PAGE_STYLE = """
+:root{--bg:#0a0a0b;--panel:#111113;--hover:#16161a;--border:#222227;--text:#e7e7ea;--muted:#8b8b94;
+--faint:#80808a;--link:#4ade80;--up:#22c55e;--down:#ef4444;--warn:#eab308;--ring:#71717a}
+*{box-sizing:border-box}
+html{background:var(--bg);color-scheme:dark}
+body{margin:0;font:.875rem/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color:var(--text)}
+.wrap{max-width:1040px;margin:0 auto;padding:40px 24px 64px}
+header{display:flex;flex-wrap:wrap;align-items:flex-end;gap:12px 24px;margin-bottom:20px}
+h1{font-size:1.375rem;font-weight:600;margin:0;letter-spacing:-.01em}
+h2{font-size:.8125rem;font-weight:500;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin:32px 0 10px}
+.sub{color:var(--muted);margin:2px 0 0}
+.sub b{color:#f87171;font-weight:500}
+.tools{display:flex;flex-wrap:wrap;gap:8px;margin-left:auto;align-items:center}
+.nojs .tools{display:none}
+.chip{font:inherit;font-size:.75rem;color:var(--muted);background:transparent;border:1px solid var(--border);
+border-radius:999px;padding:3px 10px;cursor:pointer;display:inline-flex;gap:6px;align-items:center}
+.chip:hover{color:var(--text);border-color:#3a3a42}
+.chip[aria-pressed=true]{color:var(--text);background:var(--hover);border-color:var(--link)}
+.chip b{font-weight:600;color:var(--text)}
+input{font:inherit;font-size:.8125rem;color:var(--text);background:var(--panel);border:1px solid #3a3a42;
+border-radius:8px;padding:5px 10px;width:180px}
+:focus-visible{outline:2px solid var(--link);outline-offset:2px}
+#shown{font-size:.75rem;color:var(--muted)}
+.list{list-style:none;margin:0;padding:0;border:1px solid var(--border);border-radius:12px;background:var(--panel);overflow:hidden}
+.row{position:relative;display:grid;grid-template-columns:18px minmax(0,1fr) auto;gap:4px 14px;align-items:start;
+padding:11px 16px;border-top:1px solid var(--border);margin-top:-1px}
+.row:hover{background:var(--hover)}
+[hidden]{display:none!important}
+.name{font-weight:500;color:var(--text);text-decoration:none}
+a.name::after{content:"";position:absolute;inset:0}
+a.name:focus-visible{outline:none}
+.row:has(a.name:focus-visible){outline:2px solid var(--link);outline-offset:-2px}
+.row:has(a.name):hover .name{color:var(--link)}
+.kind{font-size:.6875rem;color:var(--faint);margin-left:8px}
+.tag{font-size:.6875rem;color:var(--muted);border:1px solid var(--border);border-radius:4px;padding:0 5px;margin-left:8px}
+.links{display:flex;flex-wrap:wrap;gap:4px 10px;margin-top:2px;font-size:.75rem;color:var(--muted)}
+.links a{position:relative;z-index:1;color:var(--muted);text-decoration:none}
+.links a:hover{color:var(--link);text-decoration:underline}
+.note{font-size:.75rem;color:var(--muted);text-align:right;max-width:24rem;overflow-wrap:anywhere;padding-top:2px}
+.row[data-state=down] .note{color:#f87171}
+.row[data-state=unsure] .note,.row[data-state=checking] .note{color:#facc15}
+.dot{width:10px;height:10px;margin-top:6px;border-radius:50%;justify-self:center;border:1.5px solid var(--ring)}
+.dot.up{background:var(--up);border:0;box-shadow:0 0 0 3px rgba(34,197,94,.15)}
+.dot.down{background:var(--down);border:0;border-radius:2px;box-shadow:0 0 0 3px rgba(239,68,68,.18)}
+.dot.unsure,.dot.checking{width:12px;height:11px;margin-top:5px;background:var(--warn);border:0;border-radius:0;
+clip-path:polygon(50% 0,100% 100%,0 100%)}
+.dot.checking{animation:pulse 1.4s ease-in-out infinite}
+@keyframes pulse{50%{opacity:.35}}
+@media (prefers-reduced-motion:reduce){.dot.checking{animation:none}}
+.plain .row{grid-template-columns:minmax(0,1fr)}
+.banner{border:1px solid rgba(239,68,68,.35);background:rgba(239,68,68,.08);color:#fca5a5;border-radius:10px;padding:10px 14px}
+.empty{color:var(--muted);border:1px dashed var(--border);border-radius:12px;padding:16px;display:flex;gap:12px;align-items:center}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
+ul.skipped{color:var(--muted);padding-left:20px}
+code{font:.75rem ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--hover);border:1px solid var(--border);
+border-radius:5px;padding:1px 5px}
+footer{margin-top:28px;color:var(--faint);font-size:.75rem;display:flex;flex-wrap:wrap;gap:6px 18px}
+footer a{color:var(--muted)}
+.lost{min-height:70vh;display:flex;flex-direction:column;justify-content:center;max-width:36rem;margin:0 auto}
+.lost .code{font:600 .8125rem ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--faint);letter-spacing:.12em;margin:0 0 6px}
+.lost .host{color:var(--text);font-weight:500;overflow-wrap:anywhere}
+.button{display:inline-block;margin-top:20px;padding:8px 14px;border:1px solid var(--border);border-radius:8px;background:var(--panel);color:var(--link);text-decoration:none;font-weight:500}
+.button:hover{border-color:var(--link)}
+@media (max-width:640px){.row{grid-template-columns:18px minmax(0,1fr)}.note{grid-column:2;text-align:left;max-width:none}
+.tools{margin-left:0}input{width:100%}}
+"""
+
+FAVICON = ("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E"
+           "%3Ccircle cx='8' cy='8' r='6' fill='{color}'/%3E%3C/svg%3E")
+STATE_ORDER = {"down": 0, "unsure": 1, "checking": 1, "up": 2, "none": 3}
+STATE_LABELS = {"up": "Up", "down": "Down", "unsure": "Unsure", "checking": "Checking", "none": "No health check"}
+
+# The sites page refreshes the dots from /status.json and the DNS list from /dns.json.
+STATUS_SCRIPT = """<script>
+document.documentElement.classList.remove("nojs");
+const labels = {up: "Up", down: "Down", unsure: "Unsure", checking: "Checking", none: "No health check"};
+const order = {down: 0, unsure: 1, checking: 1, up: 2, none: 3};
+const favicon = "__FAVICON__";
+const $ = (id) => document.getElementById(id);
+let filter = "all", last = null;
+function ago(s) { s = Math.max(0, s); return s < 90 ? Math.round(s) + "s ago" : s < 5400 ? Math.round(s / 60) + " min ago" : Math.round(s / 3600) + " h ago"; }
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text) e.textContent = text; return e; }
+function serverNow(res) { return (Date.parse(res.headers.get("Date")) / 1000) || Date.now() / 1000; }
+function setNote(row, state, detail) {
+  const note = row.querySelector(".note");
+  const label = (state === "up" || state === "none") ? el("span", "sr", labels[state] + ": ") : document.createTextNode(labels[state] + " \\u00b7 ");
+  note.replaceChildren(label, document.createTextNode(detail));
+}
+function readHash() {
+  const p = new URLSearchParams(location.hash.slice(1));
+  filter = p.get("filter") || "all";
+  $("q").value = p.get("q") || "";
+}
+function writeHash() {
+  const p = new URLSearchParams(), q = $("q").value.trim();
+  if (filter !== "all") p.set("filter", filter);
+  if (q) p.set("q", q);
+  const hash = p.toString();
+  history.replaceState(null, "", hash ? "#" + hash : location.pathname + location.search);
+}
+function apply() {
+  const q = $("q").value.trim().toLowerCase();
+  let shown = 0, total = 0;
+  for (const row of document.querySelectorAll("[data-search]")) {
+    const state = row.dataset.state === "checking" ? "unsure" : row.dataset.state;
+    const statusOk = filter === "all" || (row.dataset.key && state === filter);
+    row.hidden = !statusOk || (q && !row.dataset.search.includes(q));
+    total++; if (!row.hidden) shown++;
+  }
+  for (const section of document.querySelectorAll("section[data-group]"))
+    section.hidden = !section.querySelector("[data-search]:not([hidden])");
+  for (const chip of document.querySelectorAll(".chip[data-filter]")) chip.setAttribute("aria-pressed", chip.dataset.filter === filter);
+  const filtering = filter !== "all" || q;
+  $("shown").textContent = filtering ? shown + " of " + total + " shown" : "";
+  $("empty").hidden = !filtering || !!document.querySelector("section[data-group]:not([hidden])");
+  writeHash();
+}
+async function refresh() {
+  if (document.hidden) return;
+  let data, now;
+  try {
+    const res = await fetch("/status.json", {cache: "no-store"});
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    data = await res.json(); now = serverNow(res);
+    last = {data, now, at: Date.now()};
+    $("status-error").hidden = true;
+  } catch (e) {
+    $("status-error").hidden = false;
+    $("status-error").textContent = "Status unavailable (" + e.message + "). " +
+      (last ? "Showing the results from " + ago((Date.now() - last.at) / 1000) + "." : "Showing the states from the last reload.");
+    if (!last) return;
+    data = last.data; now = last.now + (Date.now() - last.at) / 1000;
+  }
+  const counts = {all: 0, up: 0, down: 0, unsure: 0, none: 0};
+  for (const row of document.querySelectorAll(".row[data-key]")) {
+    const r = data.checks[row.dataset.key];
+    let state = "none", detail = "add a \\u2018# check:\\u2019 line to the site file";
+    if (row.dataset.check) {
+      if (!r) { state = "checking"; detail = "not checked yet"; }
+      else if (now - r.checked > 3 * data.interval) { state = "checking"; detail = "stale: " + r.note; }
+      else { state = r.state; detail = r.note; }
+      if (r) detail += " \\u00b7 " + ago(now - r.checked);
+    }
+    row.dataset.state = state;
+    const dot = row.querySelector(".dot");
+    dot.className = "dot " + state;
+    dot.setAttribute("aria-label", labels[state]);
+    dot.title = labels[state];
+    setNote(row, state, state === "none" ? "" : detail);
+    if (state === "none") row.querySelector(".note").title = detail;
+    counts.all++;
+    counts[state === "checking" ? "unsure" : state]++;
+  }
+  for (const list of document.querySelectorAll(".list[data-sorted]"))
+    list.append(...[...list.children].sort((a, b) => (order[a.dataset.state] ?? 3) - (order[b.dataset.state] ?? 3) || a.dataset.i - b.dataset.i));
+  for (const chip of document.querySelectorAll(".chip[data-filter]")) chip.querySelector("b").textContent = counts[chip.dataset.filter];
+  const down = counts.down;
+  $("downs").textContent = down ? " \\u00b7 " : "";
+  $("downs-n").textContent = down ? down + " down" : "";
+  document.title = down ? "Sites (" + down + " down)" : "Sites";
+  $("favicon").href = favicon.replace("{color}", down ? "%23ef4444" : counts.unsure ? "%23eab308" : "%2322c55e");
+  if (data.updated) {
+    $("updated").textContent = "Checked " + ago(now - data.updated);
+    $("updated").title = new Date(data.updated * 1000).toLocaleString();
+  }
+  apply();
+}
+async function loadDns() {
+  if (document.hidden) return;
+  let data, now;
+  try { const res = await fetch("/dns.json", {cache: "no-store"}); if (!res.ok) return; data = await res.json(); now = serverNow(res); } catch (e) { return; }
+  $("dns-list").replaceChildren(...data.records.map((r) => {
+    const row = el("li", "row"), main = el("div"), links = el("div", "links");
+    row.dataset.search = [r.name, r.address, r.comment, r.address === data.proxy ? "proxy" : ""].join(" ").toLowerCase();
+    main.append(el("span", "name", r.name));
+    if (r.address === data.proxy) main.append(el("span", "tag", "\\u2192 proxy"));
+    links.append(el("span", "", r.address));
+    if (r.comment) links.append(el("span", "", r.comment));
+    main.append(links); row.append(main);
+    return row;
+  }));
+  $("dns-note").textContent = data.records.length + " records point to local addresses" +
+    (data.error ? " \\u00b7 last refresh failed: " + data.error : "") + " \\u00b7 refreshed " + ago(now - data.updated);
+  apply();
+}
+for (const chip of document.querySelectorAll(".chip[data-filter]")) chip.onclick = () => { filter = chip.dataset.filter; apply(); };
+$("clear").onclick = () => { filter = "all"; $("q").value = ""; apply(); $("q").focus(); };
+$("q").oninput = apply;
+$("q").onkeydown = (e) => {
+  if (e.key === "Escape") { $("q").value = ""; apply(); }
+  if (e.key === "Enter") {
+    const links = [...document.querySelectorAll(".row:not([hidden]) a.name")];
+    if (links.length === 1) location.href = links[0].href;
+  }
+};
+document.addEventListener("keydown", (e) => {
+  if (e.key === "/" && document.activeElement !== $("q") && !e.ctrlKey && !e.metaKey) { e.preventDefault(); $("q").focus(); }
+});
+document.addEventListener("visibilitychange", () => { if (!document.hidden) { refresh(); loadDns(); } });
+window.addEventListener("hashchange", () => { readHash(); apply(); });
+readHash();
+apply();
+refresh();
+loadDns();
+setInterval(() => { refresh(); loadDns(); }, 30000);
+</script>"""
+
+NOT_FOUND_SCRIPT = """<script>
+document.getElementById("host").textContent = location.hostname;
+</script>"""
+
+
+def not_found_page(cfg):
+    """The page for names nothing is published at: say so and link to the index."""
+    index = f"https://sites.{cfg['public']}/"
+    return ("<!doctype html><html lang=en><meta charset=utf-8>"
+            "<meta name=viewport content='width=device-width,initial-scale=1'><meta name=color-scheme content=dark>"
+            f"<title>Unknown site</title><link rel=icon href=\"{FAVICON.replace('{color}', '%2371717a')}\">"
+            f"<style>{PAGE_STYLE}</style><div class=wrap><main class=lost>"
+            "<p class=code>404</p><h1>Unknown site</h1>"
+            "<p class=sub><span class=host id=host>This name</span> isn't published here.</p>"
+            f"<p><a class=button href=\"{html.escape(index)}\">See all sites \u2192</a></p>"
+            f"</main></div>{NOT_FOUND_SCRIPT}")
+
+
+
+def natural(name):
+    """personas, personas-dev, personas-preview; dockge, dockge.pi."""
+    return [(0, int(part), "") if part.isdigit() else (1, 0, part) for part in re.split(r"[-.]|(\d+)", name) if part]
+
+
+def pages(cfg, sites, skipped, tcp, sync):
+    status, now = load_status(), time.time()
+
+    def state_of(key, item):
+        state, note = check_state(item, status.get("checks", {}).get(key), cfg["check_interval"], now)
+        return state, ("" if state == "none" else note)
+
+    def row(index, key, name, kind, check, links_html, href, search):
+        title = (f'<a class=name href="{html.escape(href)}">{html.escape(name)}</a>' if href
+                 else f"<span class=name>{html.escape(name)}</span>")
+        tag = f"<span class=kind>{kind}</span>" if kind != "site" else ""
+        state, note = state_of(key, {"check": check})
+        label = STATE_LABELS[state]
+        shown = (f"<span class=sr>{label}: </span>" if state in ("up", "none") else f"{label} · ") + html.escape(note)
+        return (f'<li class=row data-key="{html.escape(key)}" data-i={index} data-state={state} '
+                f'data-search="{html.escape(search.lower())}"{" data-check=1" if check else ""}>'
+                f'<span class="dot {state}" role=img aria-label="{label}" title="{label}"></span>'
+                f"<div>{title}{tag}{links_html}</div><div class=note>{shown}</div></li>")
+
+    def site_links(name):
+        found = urls(cfg, name)
+        if not found:
+            return "", "", ""
+        return (f"<div class=links><span>{html.escape(found[0].split('://', 1)[1])}</span></div>",
+                found[0], " ".join(found))
+
+    def listing(title):
+        entries = sorted([("site", item) for item in sites], key=lambda pair: natural(pair[1]["name"]))
+        rows, counts = [], {}
+        for index, (kind, item) in enumerate(entries):
+            links_html, href, search = site_links(item["name"])
+            key = f"{kind}:{item['name']}"
+            state = state_of(key, item)[0]
+            rows.append((STATE_ORDER[state], index, row(index, key, item["name"], kind, item.get("check"),
+                                                        links_html, href, f"{item['name']} {kind} {search}")))
+            counts[state] = counts.get(state, 0) + 1
+        rows = [html_row for _, _, html_row in sorted(rows)]  # down, then unsure, then the rest
+        forwards = []
+        for index, t in enumerate(tcp):
+            ports = ", ".join(t["ports"]) or "custom rule"
+            forwards.append(row(index, f"tcp:{t['name']}", t["name"], "tcp", t.get("check"),
+                                f"<div class=links><span>{html.escape(ports)}</span></div>", "",
+                                f"{t['name']} tcp {ports}"))
+            state = state_of(f"tcp:{t['name']}", t)[0]
+            counts[state] = counts.get(state, 0) + 1
+        domain = cfg["public"]
+        down = counts.get("down", 0)
+        parts = f"{len(entries)} site{'s' if len(entries) != 1 else ''} on <code>{html.escape(domain)}</code>"
+        if forwards:
+            parts += f" · {len(forwards)} TCP forward{'s' if len(forwards) != 1 else ''}"
+        sub = (f"{parts}<span id=downs>{' · ' if down else ''}</span>"
+               f"<b id=downs-n>{f'{down} down' if down else ''}</b>")
+        chips = [("all", "All", sum(counts.values())), ("up", "Up", counts.get("up", 0)),
+                 ("down", "Down", down), ("unsure", "Unsure", counts.get("unsure", 0) + counts.get("checking", 0)),
+                 ("none", "No check", counts.get("none", 0))]
+        tools = ("<div class=tools>" + "".join(
+            f'<button type=button class=chip data-filter={key} aria-pressed={"true" if key == "all" else "false"}>'
+            f"{label} <b>{count}</b></button>" for key, label, count in chips)
+            + "<input id=q type=search placeholder='Filter (press /)' aria-label='Filter by name or address'>"
+            "<span id=shown aria-live=polite></span></div>")
+        last = (sync or {}).get("last") or {}
+        banner = (f"<p class=banner>Commit <code>{html.escape(last.get('commit', '')[:8])}</code> "
+                  f"({html.escape(last.get('subject', ''))}) was rejected: {html.escape(last.get('error', ''))}. "
+                  "The previous configuration is still running.</p>") if last and not last.get("ok") else ""
+        body = "<p id=status-error class=banner role=status hidden></p>" + banner
+        body += (f"<section data-group><h2 class=sr>Sites</h2><ul class=list data-sorted>{''.join(rows)}</ul></section>"
+                 if rows else "<p class=sub>No sites yet.</p>")
+        if forwards:
+            body += f"<section data-group><h2>TCP forwards</h2><ul class=list data-sorted>{''.join(forwards)}</ul></section>"
+        body += ("<section data-group hidden><h2>DNS records</h2><p class=sub id=dns-note></p>"
+                 "<ul class='list plain' id=dns-list></ul></section>"
+                 "<p id=empty class=empty hidden>No matches. <button type=button class=chip id=clear>Clear filters</button></p>")
+        if skipped:
+            body += "<h2>Skipped</h2><ul class=skipped>" + "".join(
+                f"<li><code>{html.escape(s['source'])}</code> {html.escape(s['reason'])}</li>" for s in skipped) + "</ul>"
+        footer = ["<span id=updated>Not checked yet</span>"]
+        applied = (sync or {}).get("applied")
+        if applied:
+            footer.append(f"<span>Config <code>{html.escape(applied['commit'][:8])}</code> "
+                          f"{html.escape(applied.get('subject', ''))}</span>")
+        color = "%23ef4444" if down else "%2322c55e"
+        return ("<!doctype html><html lang=en class=nojs><meta charset=utf-8>"
+                "<meta name=viewport content='width=device-width,initial-scale=1'><meta name=color-scheme content=dark>"
+                f"<title>{html.escape(title)}{f' ({down} down)' if down else ''}</title>"
+                f"<link id=favicon rel=icon href=\"{FAVICON.replace('{color}', color)}\">"
+                f"<style>{PAGE_STYLE}</style><div class=wrap>"
+                f"<header><div><h1>{html.escape(title)}</h1><p class=sub id=summary>{sub}</p></div>{tools}</header>"
+                f"<main>{body}</main><footer>{''.join(footer)}</footer></div>"
+                f"{STATUS_SCRIPT.replace('__FAVICON__', FAVICON)}")
+    # Unknown names serve 404.html for every path.
+    return {"index.html": listing("Sites"), "404.html": not_found_page(cfg)}
+
+
+# ----- status checks ---------------------------------------------------------
+
+def check_targets(report):
+    """Published entries as (key, item); key is kind:name, as used by the sites page."""
+    return ([("site:" + item["name"], dict(item, kind="site")) for item in report.get("sites", [])]
+            + [("tcp:" + item["name"], dict(item, kind="tcp")) for item in report.get("tcp", [])])
+
+
+def upstream(path):
+    """host:port of the first `import proxy NAME UPSTREAM` or `import forward PORT UPSTREAM`."""
+    try:
+        found = re.search(r"^\s*import\s+(?:proxy\s+\S+|forward\s+\d+)\s+(\S+)", Path(path).read_text(), re.M)
+    except OSError:
+        return ""
+    return re.sub(r"^\w+://", "", found.group(1)).split("/")[0] if found else ""
+
+
+def codes_match(code, spec):
+    for part in re.split(r"[,\s]+", spec or "200-399"):
+        low, _, high = part.partition("-")
+        if part == code or (re.fullmatch(r"\dxx", part) and part[0] == code[0]) or (
+                high and low.isdigit() and high.isdigit() and int(low) <= int(code) <= int(high)):
+            return True
+    return False
+
+
+def check_http(cfg, item, target, codes):
+    extra = []
+    if target.startswith("/"):
+        if item["kind"] != "site":
+            return "unsure", "a path check needs a site file"
+        # Through the proxy's own address: DNS name, certificate, proxy and app together.
+        scheme, port = "https", cfg["https_port"]
+        host = f"{item['name']}.{cfg['public']}"
+        address = next((a for a in cfg["bind"]), "127.0.0.1")
+        address = f"[{address}]" if ":" in address and not address.startswith("[") else address
+        extra = ["--resolve", f"{host}:{port}:{address}"] + (["--insecure"] if cfg["tls_internal"] else [])
+        target = f"{scheme}://{host}" + ("" if port in ("80", "443") else f":{port}") + target
+    result = subprocess.run(["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", "--max-time",
+                             str(CHECK_TIMEOUT), *extra, target], capture_output=True, text=True)
+    code = result.stdout.strip()
+    if result.returncode or not code.isdigit() or code == "000":
+        message = (result.stderr.strip().splitlines() or ["no answer"])[-1].removeprefix("curl: ")
+        # 35/60: TLS or certificate problems; the site may be fine, the check can't tell.
+        return ("unsure" if result.returncode in (35, 60) else "down"), message[:160]
+    if codes_match(code, codes):
+        return "up", f"HTTP {code}"
+    return ("down" if code.startswith("5") else "unsure"), f"HTTP {code} (expected {codes or '200-399'})"
+
+
+def check_tcp(address):
+    host, _, port = address.rpartition(":")
+    if not host or not port.isdigit():
+        return "unsure", f"no host:port to check ({address or 'none found'})"
+    try:
+        with socket.create_connection((host.strip("[]"), int(port)), timeout=CHECK_TIMEOUT):
+            return "up", f"{address} accepts connections"
+    except OSError as error:
+        return "down", f"{address}: {error.strerror or type(error).__name__}"
+
+
+def check_command(cfg, item, command):
+    environment = {k: v for k, v in os.environ.items() if not k.startswith("CLOUDFLARE_API_TOKEN")}
+    environment.update(CHECK_NAME=item["name"], CHECK_URL=(urls(cfg, item["name"]) or [""])[0])
+    try:
+        result = subprocess.run(["sh", "-c", command], cwd=str(ACTIVE), env=environment,
+                                capture_output=True, text=True, timeout=CHECK_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return "down", f"timed out after {CHECK_TIMEOUT}s"
+    note = ((result.stdout.strip() or result.stderr.strip()).splitlines() or [f"exit {result.returncode}"])[0]
+    return {0: "up", 1: "down"}.get(result.returncode, "unsure"), note[:160]
+
+
+def run_check(cfg, item):
+    """Return (state, note); state is up, down or unsure."""
+    spec = item["check"]
+    word, _, rest = spec.partition(" ")
+    try:
+        if word.startswith("/") or re.match(r"https?://", word):
+            return check_http(cfg, item, word, rest.strip())
+        if word == "tcp":
+            return check_tcp(rest.strip() or upstream(item["path"]))
+        if word == "run" and rest.strip():
+            return check_command(cfg, item, rest.strip())
+        return "unsure", f"unknown check: {spec[:80]}"
+    except Exception as error:  # one broken check must not stop the others
+        return "unsure", f"check failed: {type(error).__name__}: {error}"[:160]
+
+
+def load_json(path):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def load_status():
+    return load_json(STATUS)
+
+
+def write_json(path, data):
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(data, indent=1) + "\n")
+    temporary.replace(path)
+
+
+def private(address):
+    try:
+        return ipaddress.ip_address(address).is_private
+    except ValueError:
+        return False
+
+
+def refresh_dns(cfg):
+    """List the zone's A/AAAA records under PROXY_DOMAIN that point to private addresses,
+    for the sites page. At most once per check interval; one API call per 500 records."""
+    if not (cfg["public"] and token()):
+        DNS_LIST.unlink(missing_ok=True)
+        return
+    previous = load_json(DNS_LIST)
+    if time.time() - previous.get("updated", 0) < cfg["check_interval"]:
+        return
+    data = {"updated": int(time.time()), "proxy": cfg["dns_target"], "records": previous.get("records", [])}
+    try:
+        zone, records, page = zone_id(cfg), [], 1
+        if not zone:
+            raise ValueError(f"no Cloudflare zone found for {cfg['public']}")
+        while True:
+            answer = cloudflare("GET", f"/zones/{zone}/dns_records?per_page=500&page={page}")
+            if not answer.get("success"):
+                raise ValueError("; ".join(e.get("message", "?") for e in answer.get("errors", [])) or "request failed")
+            records += [{"name": r["name"], "address": r["content"], "comment": r.get("comment") or ""}
+                        for r in answer["result"] if r["type"] in ("A", "AAAA") and private(r["content"])
+                        and (r["name"] == cfg["public"] or r["name"].endswith("." + cfg["public"]))]
+            if page >= (answer.get("result_info") or {}).get("total_pages", 1):
+                break
+            page += 1
+        # The domain's wildcard first, then each host followed by its *.<host> wildcard.
+        data["records"] = sorted(records, key=lambda r: (r["name"] != "*." + cfg["public"],
+                                                         r["name"].removeprefix("*."), r["name"].startswith("*.")))
+    except (OSError, ValueError, KeyError) as error:
+        data["error"] = f"{type(error).__name__}: {error}"[:160]  # keep the last good list
+    write_json(DNS_LIST, data)
+
+
+def run_due_checks(cfg, report):
+    """Check every entry whose result is older than the interval (or whose check changed)."""
+    previous, now = load_status().get("checks", {}), time.time()
+    targets = [(key, item) for key, item in check_targets(report) if item.get("check")]
+    due = [(key, item) for key, item in targets
+           if key not in previous or previous[key].get("check") != item["check"]
+           or now - previous[key].get("checked", 0) >= cfg["check_interval"]]
+    results = {key: previous[key] for key, _ in targets if key in previous}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for (key, item), (state, note) in zip(due, pool.map(lambda pair: run_check(cfg, pair[1]), due)):
+            results[key] = {"state": state, "note": note, "checked": int(time.time()), "check": item["check"]}
+    write_json(STATUS, {"interval": cfg["check_interval"], "updated": int(time.time()), "checks": results})
+
+
+def check_state(item, record, interval, now):
+    if not item.get("check"):
+        return "none", "no status check"
+    if not record:
+        return "checking", "not checked yet"
+    if now - record["checked"] > 3 * interval:
+        return "checking", "stale: " + record["note"]
+    return record["state"], record["note"]
+
+# ----- config sync -----------------------------------------------------------
+
+def git(*args, check=True):
+    """git with the fetch token passed through the environment, never on the command line."""
+    environment = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_CONFIG_NOSYSTEM="1")
+    secret = read_secret("HQ_CONFIG_TOKEN", "HQ_CONFIG_TOKEN_FILE")
+    cfg = settings()
+    if secret and cfg["repo"].startswith("https://"):
+        basic = base64.b64encode(f"{cfg['user']}:{secret}".encode()).decode()
+        environment.update(GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="http.extraHeader",
+                           GIT_CONFIG_VALUE_0=f"Authorization: Basic {basic}")
+    result = subprocess.run(["git", *args], env=environment, capture_output=True, text=True, timeout=120)
+    if check and result.returncode != 0:
+        raise RuntimeError((result.stderr.strip().splitlines() or ["git failed"])[-1][:300])
+    return result.stdout.strip()
+
+
+def fetch(cfg):
+    """The newest commit of the config branch (cloning on first use)."""
+    branch = cfg["branch"]
+    if not (REPO / ".git").exists():
+        shutil.rmtree(REPO, ignore_errors=True)
+        git("clone", "--quiet", "--no-tags", "--single-branch", "--branch", branch, cfg["repo"], str(REPO))
+    else:
+        git("-C", str(REPO), "fetch", "--quiet", "--no-tags", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}")
+    return git("-C", str(REPO), "rev-parse", f"refs/remotes/origin/{branch}")
+
+
+def folder_digest(folder):
+    digest = hashlib.sha256()
+    for sub in ("sites", "tcp"):
+        for path in sorted((folder / sub).glob("*.caddy")) if (folder / sub).is_dir() else []:
+            digest.update(f"{sub}/{path.name}\0".encode() + path.read_bytes() + b"\0")
+    return "dir:" + digest.hexdigest()[:12]
+
+
+def commit_status(cfg, commit, ok, message):
+    """Report the result on the commit (Gitea API) when the repository is HTTPS and a token is set."""
+    secret = read_secret("HQ_CONFIG_TOKEN", "HQ_CONFIG_TOKEN_FILE")
+    url = urllib.parse.urlparse(cfg["repo"])
+    parts = url.path.strip("/").removesuffix(".git").split("/")
+    if not (secret and url.scheme == "https" and len(parts) == 2 and not commit.startswith("dir:")):
+        return
+    body = {"state": "success" if ok else "failure", "context": env("HQ_STATUS_CONTEXT", "hq-caddy"),
+            "description": ("applied" if ok else "rejected: " + message)[:140],
+            "target_url": f"https://sites.{cfg['public']}/"}
+    request = urllib.request.Request(
+        f"{url.scheme}://{url.netloc}/api/v1/repos/{parts[0]}/{parts[1]}/statuses/{commit}",
+        data=json.dumps(body).encode(), method="POST",
+        headers={"Authorization": f"token {secret}", "Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(request, timeout=15).close()
+    except (OSError, ValueError) as error:
+        log(f"commit status for {commit[:8]} not posted: {error}")
+
+
+def sync_once(cfg, force=False):
+    """Fetch the config; apply a new commit. A rejected commit is not retried until a newer one."""
+    state = load_json(SYNC)
+    now = int(time.time())
+    try:
+        if cfg["config_dir"]:
+            source, commit, subject = Path(cfg["config_dir"]), folder_digest(Path(cfg["config_dir"])), "folder"
+        elif cfg["repo"]:
+            commit = fetch(cfg)
+            source, subject = REPO, ""
+        else:
+            return
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+        state["fetch_error"] = {"at": now, "error": str(error)[:300]}
+        write_json(SYNC, state)
+        return
+    state.pop("fetch_error", None)
+    applied, last = state.get("applied", {}), state.get("last", {})
+    if not force and (commit == applied.get("commit") or (commit == last.get("commit") and not last.get("ok"))):
+        write_json(SYNC, state)
+        return
+    if source == REPO:
+        git("-C", str(REPO), "checkout", "--quiet", "--force", "--detach", commit)
+        git("-C", str(REPO), "clean", "-fdq")
+        subject = git("-C", str(REPO), "log", "-1", "--format=%s", commit)[:120]
+    attempt = {"commit": commit, "subject": subject, "at": now}
+    # The page shows the commit being applied; if it's rejected, the old page stays.
+    ok, message = apply(cfg, source, dict(state, applied=attempt, last=dict(attempt, ok=True)))
+    state["last"] = dict(attempt, ok=ok, error=message[:500])
+    if ok:
+        state["applied"] = attempt
+        log(f"applied {commit[:12]} {subject}")
+    else:
+        log(f"rejected {commit[:12]}: {message}")
+    write_json(SYNC, state)
+    if not ok:
+        rebuild(cfg)  # put the rejection banner on the page
+    commit_status(cfg, commit, ok, message)
+
+
+# ----- run -------------------------------------------------------------------
+
+STOP = threading.Event()
+
+
+def sync_loop(cfg):
+    while not STOP.is_set():
+        force = SYNC_NOW.exists()
+        SYNC_NOW.unlink(missing_ok=True)
+        try:
+            sync_once(cfg, force)
+        except Exception as error:  # keep syncing whatever one round does
+            log(f"sync failed: {type(error).__name__}: {error}")
+        for _ in range(cfg["poll"]):
+            if STOP.is_set() or SYNC_NOW.exists():
+                break
+            time.sleep(1)
+
+
+def checks_loop(cfg):
+    STOP.wait(15)
+    while not STOP.is_set():
+        try:
+            run_due_checks(cfg, load_json(REPORT))
+            refresh_dns(cfg)
+            if sorted(set(hosts(load_json(REPORT).get("sites", []))) | dns_hosts(cfg)) != load_json(REPORT).get("hosts"):
+                ok, message = rebuild(cfg)
+                log("hosts changed: " + ("reloaded" if ok else f"rebuild failed: {message}"))
+            else:
+                # Refresh the page (baked-in status, sync banner) once per check round.
+                with BUILD_LOCK:
+                    for name, content in pages(cfg, *collect(ACTIVE), load_json(SYNC)).items():
+                        (ACTIVE / "pages" / name).write_text(content)
+        except Exception as error:
+            log(f"checks failed: {type(error).__name__}: {error}")
+        STOP.wait(60)
+
+
+def caddy_loop():
+    """Run Caddy; restart it if it exits on its own; stop it gracefully on STOP."""
+    while not STOP.is_set():
+        process = subprocess.Popen(["caddy", "run", "--config", str(ACTIVE / "Caddyfile"), "--adapter", "caddyfile"],
+                                   env=caddy_env())
+        while process.poll() is None and not STOP.is_set():
+            time.sleep(0.5)
+        if STOP.is_set():
+            process.terminate()
+            try:
+                process.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                process.kill()
+            return
+        log(f"caddy exited ({process.returncode}); restarting in 5s")
+        STOP.wait(5)
+
+
+def cmd_run(_):
+    cfg = settings()
+    if not cfg["public"]:
+        log("PROXY_DOMAIN is not set (or not a valid domain); nothing to serve")
+        return 2
+    if not (cfg["repo"] or cfg["config_dir"]):
+        log("set HQ_CONFIG_REPO (or HQ_CONFIG_DIR); serving only the sites page until then")
+    STATE.mkdir(parents=True, exist_ok=True)
+    # Start from the last good snapshot so a restart serves at once, even with the repository down.
+    ok, message = rebuild(cfg)
+    if not ok:
+        log(f"last snapshot no longer valid ({message}); starting empty")
+        ok, message = apply(cfg, STATE / "empty", load_json(SYNC))
+        if not ok:
+            log(f"cannot build even an empty configuration: {message}")
+            return 1
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda *_: STOP.set())
+    threads = [threading.Thread(target=caddy_loop, daemon=True)]
+    threads[0].start()
+    for _ in range(50):  # let Caddy come up before the first reload
+        if running():
+            break
+        time.sleep(0.2)
+    threads += [threading.Thread(target=sync_loop, args=(cfg,), daemon=True),
+                threading.Thread(target=checks_loop, args=(cfg,), daemon=True)]
+    for thread in threads[1:]:
+        thread.start()
+    while not STOP.wait(1):  # a timed wait, so the signal handler always runs promptly
+        pass
+    for thread in threads:
+        thread.join(timeout=25)
+    return 0
+
+
+# ----- commands --------------------------------------------------------------
+
+def ago(seconds):
+    return f"{int(seconds)}s ago" if seconds < 90 else f"{int(seconds // 60)} min ago"
+
+
+def cmd_status(_):
+    cfg, state, now = settings(), load_json(SYNC), time.time()
+    print(f"hq-caddy {VERSION}: domain={cfg['public'] or '-'} bind={' '.join(cfg['bind']) or 'all'}")
+    source = cfg["config_dir"] or (f"{cfg['repo']} ({cfg['branch']}, every {cfg['poll']}s)" if cfg["repo"] else "none")
+    print(f"source: {source}")
+    applied, last = state.get("applied"), state.get("last")
+    print(f"applied: {applied['commit'][:12]} {applied['subject']} ({ago(now - applied['at'])})" if applied else "applied: nothing yet")
+    if last and not last.get("ok"):
+        print(f"REJECTED: {last['commit'][:12]} {last['subject']}: {last['error']}")
+    if state.get("fetch_error"):
+        print(f"fetch failing: {state['fetch_error']['error']} ({ago(now - state['fetch_error']['at'])})")
+    print("caddy: running" if running() else "caddy: NOT running")
+    return 0 if running() else 1
+
+
+def cmd_show(_):
+    print((ACTIVE / "Caddyfile").read_text() if (ACTIVE / "Caddyfile").exists() else "no active configuration", end="")
+    return 0
+
+
+def cmd_checks(_):
+    cfg, report, status, now = settings(), load_json(REPORT), load_json(STATUS), time.time()
+    for key, item in check_targets(report):
+        record = status.get("checks", {}).get(key)
+        state, note = check_state(item, record, cfg["check_interval"], now)
+        age = f" ({ago(now - record['checked'])})" if record and state != "none" else ""
+        print(f"{state:9} {item['kind']:5} {item['name']:22} {note}{age}")
+    return 0
+
+
+def cmd_sync(_):
+    SYNC_NOW.touch()
+    print("sync requested; see: hq-caddy status")
+    return 0
+
+
+def cmd_check(args):
+    if not args or not Path(args[0]).is_dir():
+        print("usage: hq-caddy check DIR (a checkout with sites/ and tcp/)")
+        return 2
+    cfg = settings()
+    cfg["public"] = cfg["public"] or "example.com"
+    work = Path(os.environ.get("TMPDIR", "/tmp")) / f"hq-caddy-check-{os.getpid()}"
+    try:
+        report = build(work / "candidate", cfg, Path(args[0]), {})
+        ok, message = validate(work / "candidate")
+        if not ok:
+            message = "; ".join(culprits(work / "candidate")) or message
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    for skip in report["skipped"]:
+        print(f"skipped {skip['source']}: {skip['reason']}")
+    print(f"{len(report['sites'])} sites, {len(report['tcp'])} tcp forwards: " + ("valid" if ok else "INVALID: " + message))
+    return 0 if ok else 1
+
+
+def cmd_version(_):
+    caddy_version = subprocess.run(["caddy", "version"], capture_output=True, text=True).stdout.split()
+    print(f"hq-caddy {VERSION} (caddy {caddy_version[0] if caddy_version else 'unknown'})")
+    return 0
+
+
+COMMANDS = {"run": cmd_run, "status": cmd_status, "show": cmd_show, "checks": cmd_checks, "sync": cmd_sync,
+            "check": cmd_check, "--version": cmd_version, "version": cmd_version}
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    if len(sys.argv) > 1 and sys.argv[1] not in COMMANDS:
+        print(__doc__.strip())
+        sys.exit(0 if sys.argv[1] in ("-h", "--help", "help") else 2)
+    sys.exit(COMMANDS[sys.argv[1] if len(sys.argv) > 1 else "run"](sys.argv[2:]))
