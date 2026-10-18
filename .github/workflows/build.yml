@@ -167,17 +167,34 @@ jobs:
           trap 'rc=$?; trap - ERR; { echo "command: $BASH_COMMAND (exit $rc)"; docker exec hq hq-caddy status || true; docker logs hq 2>&1 | tail -n 30; } 2>&1 | annotate self-test' ERR
           T=/tmp/selftest; mkdir -p "$T/up" "$T/data"; echo upstream-ok > "$T/up/marker.txt"
           (cd "$T/up" && nohup python3 -m http.server 18999 --bind 127.0.0.1 > /dev/null 2>&1 &)
+          # A stand-in relay: answers with the port header it received ("files" without one).
+          cat > "$T/relay.py" <<'EOF'
+          import http.server
+          class Handler(http.server.BaseHTTPRequestHandler):
+              def do_GET(self):
+                  body = (self.headers.get("X-Hq-Relay-Port") or "files").encode()
+                  self.send_response(200)
+                  self.end_headers()
+                  self.wfile.write(body)
+              def log_message(self, *args):
+                  pass
+          http.server.HTTPServer(("127.0.0.1", 18997), Handler).serve_forever()
+          EOF
+          nohup python3 "$T/relay.py" > /dev/null 2>&1 &
           git init -q --bare -b main "$T/config.git"; git clone -q "$T/config.git" "$T/work"
           commit() { git -C "$T/work" add -A; git -C "$T/work" -c user.name=ci -c user.email=ci@example.com commit -qm "$1"; git -C "$T/work" push -q origin main; }
           mkdir -p "$T/work/sites" "$T/work/tcp"
           printf '# check: /marker.txt\nimport proxy upstream 127.0.0.1:18999\n' > "$T/work/sites/upstream.caddy"
           printf 'import proxy hello.demo 127.0.0.1:18999\n' > "$T/work/sites/hello.demo.caddy"
           printf '# check: tcp\nimport forward 18022 127.0.0.1:18999\n' > "$T/work/tcp/echo.caddy"
+          printf 'import relay relayed 8788\n' > "$T/work/sites/relayed.caddy"
+          printf 'import relay_files static1\n' > "$T/work/sites/static1.caddy"
+          printf 'import site custom {\n\trespond /internal/* 404\n\timport relay_upstream 31143\n}\n' > "$T/work/sites/custom.caddy"
           commit "first sites"
           docker run --rm "$IMAGE:latest" --version
           docker run -d --name hq --network host --user "$(id -u):$(id -g)" -e HOME=/data \
             -e PROXY_DOMAIN=example.test -e HQ_TLS=internal -e PROXY_BIND=127.0.0.1 \
-            -e PROXY_HTTP_PORT=18080 -e PROXY_HTTPS_PORT=18443 -e HQ_POLL_SECONDS=3 \
+            -e PROXY_HTTP_PORT=18080 -e PROXY_HTTPS_PORT=18443 -e HQ_POLL_SECONDS=3 -e HQ_RELAY=127.0.0.1:18997 \
             -e HQ_CONFIG_REPO=file:///config.git -v "$T/config.git:/config.git" -v "$T/data:/data" "$IMAGE:latest"
           get() { curl -sk -o /dev/null -w '%{http_code}' --resolve "$1.example.test:18443:127.0.0.1" "https://$1.example.test:18443$2"; }
           wait_for() { for _ in $(seq 1 40); do eval "$1" && return 0; sleep 1; done; echo "timed out: $1"; return 1; }
@@ -191,6 +208,12 @@ jobs:
           [ "$(get nothing.demo /)" = 404 ]
           [ "$(get no-such-site /)" = 404 ]
           [ "$(curl -s -m 5 http://127.0.0.1:18022/marker.txt)" = upstream-ok ]
+          # Relay: the port travels in the header; relay_files strips even a forged one.
+          body() { curl -sk --resolve "$1.example.test:18443:127.0.0.1" "https://$1.example.test:18443$2" "${@:3}"; }
+          [ "$(body relayed /)" = 8788 ]
+          [ "$(body custom /x)" = 31143 ]
+          [ "$(get custom /internal/a)" = 404 ]
+          [ "$(body static1 / -H 'X-Hq-Relay-Port: 22')" = files ]
           status_has 'applied: .* first sites'
           # A broken commit is rejected with the file named; the old config keeps serving.
           printf 'import site bad {\n\treverse_proxy 127.0.0.1:1\n' > "$T/work/sites/bad.caddy"; commit "broken site"

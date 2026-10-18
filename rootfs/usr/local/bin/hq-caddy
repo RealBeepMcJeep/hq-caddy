@@ -19,6 +19,8 @@ Settings (environment):
   HQ_POLL_SECONDS            seconds between fetches (default 30, min 5)
   HQ_STATUS_CONTEXT          name of the commit status (default hq-caddy)
   HQ_TLS                     "internal": certificates from Caddy's local CA (tests)
+  HQ_RELAY                   host:port of a relay for services that listen only on
+                             loopback on another box (see `relay` below)
   PROXY_BIND                 addresses to listen on, comma/space separated (default all)
   PROXY_HTTP_PORT/PROXY_HTTPS_PORT  listener ports (default 80/443)
   PROXY_MANAGE_DNS           true: create missing *.<host>.<domain> A records for
@@ -30,6 +32,8 @@ Config repository layout:
   sites/<name>.caddy   one site: `import proxy <name> <upstream>` or
                        `import site <name> { ... }` with any Caddy directives
   tcp/<name>.caddy     raw TCP: `import forward <port> <upstream>`
+  Through HQ_RELAY:    `import relay <name> <port>`, `import relay_upstream <port>`
+                       (inside `import site`), `import relay_files <name>` (static)
   A `# check: ...` line in a file defines its status check (see the README).
 
 Commands:
@@ -103,6 +107,7 @@ def settings():
         "user": env("HQ_CONFIG_USER", "hq-caddy"),
         "repo_token_file": env("HQ_CONFIG_TOKEN_FILE"),
         "config_dir": env("HQ_CONFIG_DIR"),
+        "relay": env("HQ_RELAY"),
         "poll": number("HQ_POLL_SECONDS", 30, 5),
         "check_interval": number("PROXY_CHECK_INTERVAL", 300, 60),
         "manage_dns": env("PROXY_MANAGE_DNS").lower() in ("1", "true", "yes", "on"),
@@ -269,6 +274,17 @@ def caddyfile(cfg, sites, tcp, host_names, target):
     out += ["(site) {", f"\t{{args[0]}}.{public} {{", "\t\t{block}", "\t}", "}", "",
             "# import proxy NAME UPSTREAM", "(proxy) {", "\timport site {args[0]} {",
             "\t\treverse_proxy {args[1]}", "\t}", "}", ""]
+    # A relay on another box reaches its loopback-only services: the port travels in a
+    # header (the relay trusts only this proxy); relay_files drops it (static folder by Host).
+    if cfg["relay"]:
+        upstream_port = [f"\treverse_proxy {cfg['relay']} {{", "\t\theader_up X-Hq-Relay-Port {args[0]}", "\t}"]
+        upstream_files = [f"\treverse_proxy {cfg['relay']} {{", "\t\theader_up -X-Hq-Relay-Port", "\t}"]
+    else:
+        upstream_port = upstream_files = ['\trespond "relay not configured (HQ_RELAY)" 502']
+    out += ["# import relay NAME PORT / relay_upstream PORT / relay_files NAME", "(relay_upstream) {"] + upstream_port + ["}", "",
+            "(relay) {", "\timport site {args[0]} {", "\t\timport relay_upstream {args[1]}", "\t}", "}", "",
+            "(relay_files_upstream) {"] + upstream_files + ["}", "",
+            "(relay_files) {", "\timport site {args[0]} {", "\t\timport relay_files_upstream", "\t}", "}", ""]
 
     # The sites page, the unknown-name page and HTTP->HTTPS redirects.
     out += ["import site sites {"]
