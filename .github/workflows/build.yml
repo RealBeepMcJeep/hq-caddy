@@ -156,33 +156,55 @@ jobs:
           cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
           cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max
 
-      # An HTTP site and a layer4 TCP forward to it, through the built image.
+      # The generator end to end: a local git repo as the config source, an upstream,
+      # a TCP forward, a rejected commit (named file, old config keeps serving), a fix,
+      # status checks, and a clean stop. Certificates come from Caddy's local CA.
       - name: Self-test
         run: |
-          set -euo pipefail
-          mkdir -p /tmp/selftest
-          cat > /tmp/selftest/Caddyfile <<'EOF'
-          {
-            admin off
-            layer4 {
-              :18022 {
-                route {
-                  proxy 127.0.0.1:18080
-                }
-              }
-            }
-          }
-          http://:18080 {
-            respond "hq-caddy-ok"
-          }
-          EOF
+          # shellcheck disable=SC2016,SC2154  # wait_for evaluates its quoted condition; rc is set in the trap
+          set -Eeuo pipefail
+          annotate() { local text; text="$(cat)"; text="${text//'%'/'%25'}"; echo "::error title=$1::${text//$'\n'/'%0A'}"; }
+          trap 'rc=$?; trap - ERR; { echo "command: $BASH_COMMAND (exit $rc)"; docker exec hq hq-caddy status || true; docker logs hq 2>&1 | tail -n 30; } 2>&1 | annotate self-test' ERR
+          T=/tmp/selftest; mkdir -p "$T/up" "$T/data"; echo upstream-ok > "$T/up/marker.txt"
+          (cd "$T/up" && nohup python3 -m http.server 18999 --bind 127.0.0.1 > /dev/null 2>&1 &)
+          git init -q --bare -b main "$T/config.git"; git clone -q "$T/config.git" "$T/work"
+          commit() { git -C "$T/work" add -A; git -C "$T/work" -c user.name=ci -c user.email=ci@example.com commit -qm "$1"; git -C "$T/work" push -q origin main; }
+          mkdir -p "$T/work/sites" "$T/work/tcp"
+          printf '# check: /marker.txt\nimport proxy upstream 127.0.0.1:18999\n' > "$T/work/sites/upstream.caddy"
+          printf 'import proxy hello.demo 127.0.0.1:18999\n' > "$T/work/sites/hello.demo.caddy"
+          printf '# check: tcp\nimport forward 18022 127.0.0.1:18999\n' > "$T/work/tcp/echo.caddy"
+          commit "first sites"
           docker run --rm "$IMAGE:latest" --version
-          docker run -d --name selftest --network host -e HQ_CADDYFILE=/etc/selftest/Caddyfile \
-            -v /tmp/selftest:/etc/selftest:ro "$IMAGE:latest"
-          for _ in $(seq 1 20); do curl -fsS http://127.0.0.1:18080/ > /dev/null 2>&1 && break; sleep 1; done
-          [ "$(curl -fsS http://127.0.0.1:18080/)" = hq-caddy-ok ] || { echo "::error::HTTP site failed"; docker logs selftest; exit 1; }
-          [ "$(curl -fsS http://127.0.0.1:18022/)" = hq-caddy-ok ] || { echo "::error::layer4 forward failed"; docker logs selftest; exit 1; }
-          docker stop -t 10 selftest
+          docker run -d --name hq --network host --user "$(id -u):$(id -g)" -e HOME=/data \
+            -e PROXY_DOMAIN=example.test -e HQ_TLS=internal -e PROXY_BIND=127.0.0.1 \
+            -e PROXY_HTTP_PORT=18080 -e PROXY_HTTPS_PORT=18443 -e HQ_POLL_SECONDS=3 \
+            -e HQ_CONFIG_REPO=file:///config.git -v "$T/config.git:/config.git" -v "$T/data:/data" "$IMAGE:latest"
+          get() { curl -sk -o /dev/null -w '%{http_code}' --resolve "$1.example.test:18443:127.0.0.1" "https://$1.example.test:18443$2"; }
+          wait_for() { for _ in $(seq 1 40); do eval "$1" && return 0; sleep 1; done; echo "timed out: $1"; return 1; }
+          wait_for '[ "$(get upstream /marker.txt)" = 200 ]'
+          [ "$(get sites /)" = 200 ]
+          [ "$(get hello.demo /marker.txt)" = 200 ]
+          [ "$(get nothing.demo /)" = 404 ]
+          [ "$(get no-such-site /)" = 404 ]
+          [ "$(curl -s -m 5 http://127.0.0.1:18022/marker.txt)" = upstream-ok ]
+          docker exec hq hq-caddy status | grep -q 'applied: .* first sites'
+          # A broken commit is rejected with the file named; the old config keeps serving.
+          printf 'import site bad {\n\treverse_proxy 127.0.0.1:1\n' > "$T/work/sites/bad.caddy"; commit "broken site"
+          wait_for 'docker exec hq hq-caddy status | grep -q "REJECTED: .*sites/bad.caddy: unbalanced braces"'
+          [ "$(get upstream /marker.txt)" = 200 ]
+          curl -sk --resolve sites.example.test:18443:127.0.0.1 https://sites.example.test:18443/ | grep -q 'was rejected'
+          # The fix applies and clears the banner.
+          rm "$T/work/sites/bad.caddy"; printf 'import proxy second 127.0.0.1:18999\n' > "$T/work/sites/second.caddy"; commit "fix"
+          wait_for '[ "$(get second /marker.txt)" = 200 ]'
+          if curl -sk --resolve sites.example.test:18443:127.0.0.1 https://sites.example.test:18443/ | grep -q 'was rejected'; then
+            echo "the rejection banner is still shown after the fix"; false
+          fi
+          # Status checks (the first round runs 15 s after start).
+          wait_for 'curl -sk --resolve sites.example.test:18443:127.0.0.1 https://sites.example.test:18443/status.json | jq -e ".checks[\"site:upstream\"].state == \"up\" and .checks[\"tcp:echo\"].state == \"up\"" > /dev/null'
+          docker exec hq hq-caddy checks
+          start=$SECONDS; docker stop -t 30 hq > /dev/null
+          [ "$(docker inspect -f '{{.State.ExitCode}}' hq)" = 0 ] && [ $((SECONDS - start)) -lt 25 ]
+          echo "self-test passed"
 
       # Every platform: the arm64 build runs the module check under emulation.
       # Pushes only from main (publish), after the self-test above.
