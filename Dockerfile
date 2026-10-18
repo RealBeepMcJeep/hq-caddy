@@ -6,8 +6,8 @@
 #
 # Build arguments come from scripts/probe-versions.sh (exact versions and image
 # digests); the defaults only make a plain `docker build` work.
-ARG CADDY_BUILDER_IMAGE=public.ecr.aws/docker/library/caddy:2-builder
-ARG CADDY_IMAGE=public.ecr.aws/docker/library/caddy:2-alpine
+ARG CADDY_BUILDER_IMAGE=mirror.gcr.io/library/caddy:2-builder
+ARG CADDY_IMAGE=mirror.gcr.io/library/caddy:2-alpine
 
 # The builder runs on the build machine and cross-compiles for each target.
 FROM --platform=$BUILDPLATFORM ${CADDY_BUILDER_IMAGE} AS builder
