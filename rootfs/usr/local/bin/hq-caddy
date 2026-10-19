@@ -278,14 +278,15 @@ def caddyfile(cfg, sites, tcp, host_names, target):
     # A relay on another box reaches its loopback-only services: the port travels in a
     # header (the relay trusts only this proxy); relay_files drops it (static folder by Host).
     # Every relay snippet sets or removes BOTH relay headers, so a client can never
-    # pass its own X-Hq-Relay-Port/Root through to the relay.
+    # pass its own X-Hq-Relay-Port/Root through to the relay. The relay is a pass-through
+    # hop: flush every write, so streams (SSE, long polls) aren't held back here.
     if cfg["relay"]:
         upstream_port = [f"\treverse_proxy {cfg['relay']} {{", "\t\theader_up X-Hq-Relay-Port {args[0]}",
-                         "\t\theader_up -X-Hq-Relay-Root", "\t}"]
+                         "\t\theader_up -X-Hq-Relay-Root", "\t\tflush_interval -1", "\t}"]
         upstream_files = [f"\treverse_proxy {cfg['relay']} {{", "\t\theader_up -X-Hq-Relay-Port",
-                          "\t\theader_up -X-Hq-Relay-Root", "\t}"]
+                          "\t\theader_up -X-Hq-Relay-Root", "\t\tflush_interval -1", "\t}"]
         upstream_root = [f"\treverse_proxy {cfg['relay']} {{", "\t\theader_up X-Hq-Relay-Root {args[0]}",
-                         "\t\theader_up -X-Hq-Relay-Port", "\t}"]
+                         "\t\theader_up -X-Hq-Relay-Port", "\t\tflush_interval -1", "\t}"]
     else:
         upstream_port = upstream_files = upstream_root = ['\trespond "relay not configured (HQ_RELAY)" 502']
     out += ["# import relay NAME PORT / relay_upstream PORT / relay_files NAME", "(relay_upstream) {"] + upstream_port + ["}", "",
