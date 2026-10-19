@@ -74,15 +74,22 @@ and forwards to the loopback port named in the `X-Hq-Relay-Port` header. Set
 ```caddy
 import relay myapp 8788                 # https://myapp.<domain> -> relay -> 127.0.0.1:8788
 import relay_files docs                 # the relay's static folder "docs" (chosen by Host)
+import site preview {
+	@hidden path *.mjs                  # hide rules run here, on this proxy
+	respond @hidden 404
+	import relay_root /srv/app/preview  # files from that folder on the relay's box
+}
 import site api {
 	respond /internal/* 404
 	import relay_upstream 9000          # inside a custom block
 }
 ```
 
-`relay_files` removes any `X-Hq-Relay-Port` a client sent. Without `HQ_RELAY`, these
-sites answer 502 "relay not configured". The relay itself (trust only this proxy's
-IP, keep its `X-Forwarded-*`) runs on the other box.
+Every relay snippet sets or removes both relay headers (`X-Hq-Relay-Port`,
+`X-Hq-Relay-Root`), so clients can't inject them. The relay decides which folders
+`relay_root` may name (e.g. only under one directory, no dotfiles). Without
+`HQ_RELAY`, these sites answer 502 "relay not configured". The relay itself (trust
+only this proxy's IP, keep its `X-Forwarded-*`) runs on the other box.
 
 ### Status checks
 
@@ -117,7 +124,7 @@ problem, or no result yet. Each entry is checked at most every
 | `PROXY_MANAGE_DNS` | `true`: create a missing `*.<host>.<domain>` A record for each `<service>.<host>` site (create-only, never edits or deletes) |
 | `PROXY_DNS_TARGET` | Address for those records (default: the first IPv4 `PROXY_BIND`) |
 | `PROXY_CHECK_INTERVAL` | Seconds between status checks of one entry (default 300, minimum 60) |
-| `HQ_RELAY` | `host:port` of a relay for loopback-only services on another box (`relay`, `relay_upstream`, `relay_files`) |
+| `HQ_RELAY` | `host:port` of a relay for loopback-only services on another box (`relay`, `relay_upstream`, `relay_files`, `relay_root`) |
 | `HQ_TLS` | `internal`: certificates from Caddy's local CA instead of Let's Encrypt (testing) |
 
 Point a DNS-only wildcard `*.<domain>` at the proxy's address. A host that has
