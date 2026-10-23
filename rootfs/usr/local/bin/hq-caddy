@@ -26,6 +26,7 @@ Settings (environment):
   PROXY_MANAGE_DNS           true: create missing *.<host>.<domain> A records for
                              <service>.<host> sites (create-only)
   PROXY_DNS_TARGET           address for those records (default: first IPv4 PROXY_BIND)
+  HQ_DNS_RECORDS             true: keep the zone's records in line with dns/records (below)
   PROXY_CHECK_INTERVAL       seconds between status checks of one site (default 300, min 60)
 
 Config repository layout:
@@ -35,6 +36,10 @@ Config repository layout:
   Through HQ_RELAY:    `import relay <name> <port>`, `import relay_upstream <port>`
                        (inside `import site`), `import relay_files <name>` (static),
                        `import relay_root <folder>` (files from a folder on the relay's box)
+  dns/records          DNS records under the domain, one per line: `<name> <A|AAAA|CNAME> <value>`
+                       (`@` is the domain itself). Applied with HQ_DNS_RECORDS: creates and
+                       updates them, deletes only records it created (tagged in their comment),
+                       and never changes any other record. Without the file, nothing is managed.
   A `# check: ...` line in a file defines its status check (see the README).
 
 Commands:
@@ -43,6 +48,7 @@ Commands:
   show       print the active Caddy configuration
   checks     list every status check result
   sync       fetch and apply now instead of waiting for the next poll
+  dns        the last dns/records result (--plan: compute the changes now, apply nothing)
   check DIR  build and validate DIR (a checkout of the config repository) without applying
   --version  print the hq-caddy and Caddy versions
 """
@@ -66,7 +72,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 STATE = Path(os.environ.get("HQ_STATE_DIR", "/data/hq-caddy"))
 ACTIVE = STATE / "active"
 CANDIDATE = STATE / "candidate"
@@ -77,6 +83,8 @@ STATUS = STATE / "status.json"
 DNS_LIST = STATE / "dns.json"
 SYNC = STATE / "sync.json"
 SYNC_NOW = STATE / "sync-now"
+RECORDS_STATE = STATE / "records.json"
+RECORDS_TAG = "hq-caddy records"  # comment prefix of records it manages; nothing else is ever changed
 ADMIN = os.environ.get("HQ_ADMIN", "localhost:2019")  # Caddy admin API, inside the container only
 RESERVED = {"sites"}
 NAME = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$")
@@ -112,6 +120,7 @@ def settings():
         "poll": number("HQ_POLL_SECONDS", 30, 5),
         "check_interval": number("PROXY_CHECK_INTERVAL", 300, 60),
         "manage_dns": env("PROXY_MANAGE_DNS").lower() in ("1", "true", "yes", "on"),
+        "manage_records": env("HQ_DNS_RECORDS").lower() in ("1", "true", "yes", "on"),
         "dns_target": env("PROXY_DNS_TARGET") or next((a for a in bind if re.fullmatch(r"[0-9.]+", a)), ""),
     }
 
@@ -179,7 +188,8 @@ def forward_ports(path):
 
 
 def cloudflare(method, path, data=None):
-    req = urllib.request.Request("https://api.cloudflare.com/client/v4" + path, method=method,
+    api = env("HQ_CLOUDFLARE_API", "https://api.cloudflare.com/client/v4")  # override for tests only
+    req = urllib.request.Request(api + path, method=method,
                                  data=json.dumps(data).encode() if data is not None else None,
                                  headers={"Authorization": f"Bearer {token()}", "Content-Type": "application/json"})
     try:
@@ -225,6 +235,179 @@ def ensure_dns(cfg, names):
     except (OSError, ValueError) as error:
         results.append({"name": "*", "state": f"error: {type(error).__name__}"})
     return results
+
+
+# ----- DNS records file (dns/records) --------------------------------------------
+
+RECORD_NAME = re.compile(r"^(@|(\*\.)?[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?(\.[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?)*|\*)$")
+
+
+def parse_records(text, domain):
+    """dns/records lines -> (records, errors). A record: name, type, value, note."""
+    records, errors = [], []
+    for number, raw in enumerate(text.splitlines(), 1):
+        line, _, note = raw.partition("#")
+        fields = line.split()
+        if not fields:
+            continue
+        if len(fields) != 3:
+            errors.append(f"line {number}: expected `<name> <type> <value>`")
+            continue
+        name, kind, value = fields[0].lower(), fields[1].upper(), fields[2]
+        if not RECORD_NAME.match(name):
+            errors.append(f"line {number}: invalid name {name!r} (relative to the domain; @ for the domain)")
+            continue
+        try:
+            if kind == "A":
+                value = str(ipaddress.IPv4Address(value))
+            elif kind == "AAAA":
+                value = str(ipaddress.IPv6Address(value))
+            elif kind == "CNAME":
+                value = value.lower().rstrip(".")
+                if not DOMAIN.match(value):
+                    raise ValueError
+            else:
+                errors.append(f"line {number}: type {kind} not supported (A, AAAA, CNAME)")
+                continue
+        except ValueError:
+            errors.append(f"line {number}: invalid {kind} value {value!r}")
+            continue
+        fqdn = domain if name == "@" else f"{name}.{domain}"
+        if any(r["name"] == fqdn and r["type"] == kind and r["value"] == value for r in records):
+            errors.append(f"line {number}: duplicate of an earlier line")
+            continue
+        records.append({"name": fqdn, "type": kind, "value": value, "note": note.strip()})
+    for fqdn in {r["name"] for r in records if r["type"] == "CNAME"}:
+        if sum(r["name"] == fqdn for r in records) > 1:
+            errors.append(f"{fqdn}: a CNAME can't share its name with other records")
+    return records, errors
+
+
+def records_file(folder):
+    path = Path(folder) / "dns" / "records"
+    return path if path.is_file() else None
+
+
+def record_comment(note):
+    return (f"{RECORDS_TAG}: {note}" if note else RECORDS_TAG)[:100]  # Cloudflare's comment limit
+
+
+def zone_records(zone):
+    """Every record of the zone (the list API pages at 500)."""
+    records, page = [], 1
+    while True:
+        answer = cloudflare("GET", f"/zones/{zone}/dns_records?per_page=500&page={page}")
+        if not answer.get("success"):
+            raise ValueError("; ".join(e.get("message", "?") for e in answer.get("errors", [])) or "request failed")
+        records += answer["result"]
+        if page >= (answer.get("result_info") or {}).get("total_pages", 1):
+            return records
+        page += 1
+
+
+def plan_records(wanted, existing):
+    """The changes that bring the zone in line with dns/records, touching only records that
+    carry RECORDS_TAG or that it adopts (same name, type and value). Returns (changes, conflicts)."""
+    managed = lambda r: (r.get("comment") or "").startswith(RECORDS_TAG)
+    changes, conflicts = [], []
+    keys = sorted({(w["name"], w["type"]) for w in wanted})
+    for name, kind in keys:
+        want = {w["value"]: w for w in wanted if (w["name"], w["type"]) == (name, kind)}
+        here = [r for r in existing if r["name"] == name and r["type"] == kind]
+        others = [r for r in existing if r["name"] == name and r["type"] != kind and not managed(r)
+                  and (kind == "CNAME" or r["type"] == "CNAME")]
+        strangers = [r for r in here if not managed(r) and r["content"] not in want]
+        if strangers or others:
+            for r in strangers + others:
+                conflicts.append(f"{name} {r['type']} {r['content']} exists and isn't managed by hq-caddy "
+                                 "(remove it, or list that value)")
+            continue  # leave this name alone until resolved
+        spare = []
+        for record in here:
+            item = want.pop(record["content"], None)
+            if item is None:
+                spare.append(record)  # managed, value no longer listed
+            elif record.get("comment") != record_comment(item["note"]) or record.get("proxied"):
+                changes.append({"action": "adopt" if not managed(record) else "update", "id": record["id"],
+                                "name": name, "type": kind, "value": item["value"], "note": item["note"]})
+        for item in want.values():
+            if spare:
+                record = spare.pop()
+                changes.append({"action": "update", "id": record["id"], "name": name, "type": kind,
+                                "value": item["value"], "note": item["note"], "was": record["content"]})
+            else:
+                changes.append({"action": "create", "name": name, "type": kind, "value": item["value"],
+                                "note": item["note"]})
+        changes += [{"action": "delete", "id": r["id"], "name": name, "type": kind, "value": r["content"]} for r in spare]
+    listed = set(keys)
+    changes += [{"action": "delete", "id": r["id"], "name": r["name"], "type": r["type"], "value": r["content"]}
+                for r in existing if managed(r) and (r["name"], r["type"]) not in listed]
+    # Deletes first, so a type change (e.g. A -> CNAME) never collides.
+    return sorted(changes, key=lambda c: c["action"] != "delete"), conflicts
+
+
+RECORDS_LOCK = threading.Lock()
+
+
+def reconcile_records(cfg, folder, apply_changes=True):
+    """Apply dns/records from folder; write and return the result."""
+    path = records_file(folder)
+    result = {"at": int(time.time()), "changes": [], "conflicts": [], "error": ""}
+    if not path:
+        result["note"] = "no dns/records file: no records managed"
+    elif not cfg["manage_records"]:
+        result["note"] = "dns/records present, but HQ_DNS_RECORDS is off"
+    elif not (cfg["public"] and token()):
+        result["error"] = "HQ_DNS_RECORDS needs PROXY_DOMAIN and a Cloudflare token"
+    else:
+        wanted, errors = parse_records(path.read_text(), cfg["public"])
+        with RECORDS_LOCK:
+            try:
+                if errors:
+                    raise ValueError("dns/records: " + "; ".join(errors))
+                zone = zone_id(cfg)
+                if not zone:
+                    raise ValueError(f"no Cloudflare zone found for {cfg['public']}")
+                changes, result["conflicts"] = plan_records(wanted, zone_records(zone))
+                for change in changes:
+                    done = "planned"
+                    if apply_changes:
+                        body = {"type": change["type"], "name": change["name"], "content": change["value"],
+                                "proxied": False, "ttl": 1, "comment": record_comment(change.get("note", ""))}
+                        answer = (cloudflare("DELETE", f"/zones/{zone}/dns_records/{change['id']}")
+                                  if change["action"] == "delete" else
+                                  cloudflare("POST", f"/zones/{zone}/dns_records", body) if change["action"] == "create" else
+                                  cloudflare("PATCH", f"/zones/{zone}/dns_records/{change['id']}", body))
+                        done = "done" if answer.get("success") else "failed: " + "; ".join(
+                            e.get("message", "?") for e in answer.get("errors", []))
+                        if done == "done":
+                            log(f"DNS {change['action']} {change['name']} {change['type']} {change['value']}")
+                    result["changes"].append(dict(change, state=done))
+            except (OSError, ValueError, KeyError) as error:
+                result["error"] = f"{type(error).__name__}: {error}"[:300]
+    if apply_changes:
+        write_json(RECORDS_STATE, result)
+    return result
+
+
+def records_ok(result):
+    return not (result.get("error") or result.get("conflicts")
+                or any(c["state"].startswith("failed") for c in result.get("changes", [])))
+
+
+def records_summary(result):
+    """One line for the commit status ("" when records aren't managed or nothing changed)."""
+    if result.get("error"):
+        return "DNS error: " + result["error"]
+    failed = [c for c in result.get("changes", []) if c["state"].startswith("failed")]
+    if failed or result.get("conflicts"):
+        return "DNS: " + "; ".join([f"{c['action']} {c['name']} {c['state']}" for c in failed] + result.get("conflicts", []))
+    counts = {}
+    for change in result.get("changes", []):
+        counts[change["action"]] = counts.get(change["action"], 0) + 1
+    return ("DNS: " + ", ".join(f"{n} {a}" for a, n in sorted(counts.items()))) if counts else ""
+
+
 # ----- configuration ---------------------------------------------------------
 
 def quote(value):
@@ -332,6 +515,9 @@ def build(target, cfg, source, sync):
         (target / sub).mkdir(parents=True)
         for path in sorted((source / sub).glob("*.caddy")) if (source / sub).is_dir() else []:
             shutil.copy2(path, target / sub / path.name)
+    if records_file(source):
+        (target / "dns").mkdir()
+        shutil.copy2(records_file(source), target / "dns" / "records")
     (target / "pages").mkdir()
     sites, skipped, tcp = collect(target)
     host_names = set(hosts(sites)) | dns_hosts(cfg)
@@ -431,6 +617,10 @@ def apply(cfg, source, sync):
         ok, message = validate(CANDIDATE)
         if not ok:
             message = "; ".join(culprits(CANDIDATE)) or message
+        record_errors = parse_records(records_file(CANDIDATE).read_text(), cfg["public"])[1] if records_file(CANDIDATE) else []
+        if record_errors:
+            ok, message = False, "; ".join(([message] if not ok else []) + ["dns/records: " + "; ".join(record_errors)])
+        if not ok:
             shutil.rmtree(CANDIDATE, ignore_errors=True)
             return False, message
         previous = STATE / "previous"
@@ -986,18 +1176,20 @@ def folder_digest(folder):
     for sub in ("sites", "tcp"):
         for path in sorted((folder / sub).glob("*.caddy")) if (folder / sub).is_dir() else []:
             digest.update(f"{sub}/{path.name}\0".encode() + path.read_bytes() + b"\0")
+    if records_file(folder):
+        digest.update(b"dns/records\0" + records_file(folder).read_bytes())
     return "dir:" + digest.hexdigest()[:12]
 
 
-def commit_status(cfg, commit, ok, message):
+def commit_status(cfg, commit, ok, message, dns="", dns_ok=True):
     """Report the result on the commit (Gitea API) when the repository is HTTPS and a token is set."""
     secret = read_secret("HQ_CONFIG_TOKEN", "HQ_CONFIG_TOKEN_FILE")
     url = urllib.parse.urlparse(cfg["repo"])
     parts = url.path.strip("/").removesuffix(".git").split("/")
     if not (secret and url.scheme == "https" and len(parts) == 2 and not commit.startswith("dir:")):
         return
-    body = {"state": "success" if ok else "failure", "context": env("HQ_STATUS_CONTEXT", "hq-caddy"),
-            "description": ("applied" if ok else "rejected: " + message)[:140],
+    body = {"state": "success" if ok and dns_ok else "failure", "context": env("HQ_STATUS_CONTEXT", "hq-caddy"),
+            "description": (("applied" + (f"; {dns}" if dns else "")) if ok else "rejected: " + message)[:140],
             "target_url": f"https://sites.{cfg['public']}/"}
     request = urllib.request.Request(
         f"{url.scheme}://{url.netloc}/api/v1/repos/{parts[0]}/{parts[1]}/statuses/{commit}",
@@ -1038,15 +1230,21 @@ def sync_once(cfg, force=False):
     # The page shows the commit being applied; if it's rejected, the old page stays.
     ok, message = apply(cfg, source, dict(state, applied=attempt, last=dict(attempt, ok=True)))
     state["last"] = dict(attempt, ok=ok, error=message[:500])
+    dns, dns_ok = "", True
     if ok:
         state["applied"] = attempt
         log(f"applied {commit[:12]} {subject}")
     else:
         log(f"rejected {commit[:12]}: {message}")
     write_json(SYNC, state)
-    if not ok:
+    if ok:
+        result = reconcile_records(cfg, ACTIVE)
+        dns, dns_ok = records_summary(result), records_ok(result)
+        if dns:
+            log(dns)
+    else:
         rebuild(cfg)  # put the rejection banner on the page
-    commit_status(cfg, commit, ok, message)
+    commit_status(cfg, commit, ok, message, dns, dns_ok)
 
 
 # ----- run -------------------------------------------------------------------
@@ -1073,6 +1271,8 @@ def checks_loop(cfg):
     while not STOP.is_set():
         try:
             run_due_checks(cfg, load_json(REPORT))
+            if time.time() - load_json(RECORDS_STATE).get("at", 0) >= cfg["check_interval"]:
+                reconcile_records(cfg, ACTIVE)  # repairs drift and retries failures
             refresh_dns(cfg)
             if sorted(set(hosts(load_json(REPORT).get("sites", []))) | dns_hosts(cfg)) != load_json(REPORT).get("hosts"):
                 ok, message = rebuild(cfg)
@@ -1157,6 +1357,9 @@ def cmd_status(_):
         print(f"REJECTED: {last['commit'][:12]} {last['subject']}: {last['error']}")
     if state.get("fetch_error"):
         print(f"fetch failing: {state['fetch_error']['error']} ({ago(now - state['fetch_error']['at'])})")
+    records = load_json(RECORDS_STATE)
+    if records:
+        print(f"dns/records: {records_summary(records) or records.get('note') or 'in sync'} ({ago(now - records['at'])})")
     print("caddy: running" if running() else "caddy: NOT running")
     return 0 if running() else 1
 
@@ -1199,7 +1402,35 @@ def cmd_check(args):
     for skip in report["skipped"]:
         print(f"skipped {skip['source']}: {skip['reason']}")
     print(f"{len(report['sites'])} sites, {len(report['tcp'])} tcp forwards: " + ("valid" if ok else "INVALID: " + message))
+    if records_file(args[0]):
+        records, errors = parse_records(records_file(args[0]).read_text(), cfg["public"])
+        print(f"dns/records: {len(records)} records: " + ("valid" if not errors else "INVALID: " + "; ".join(errors)))
+        ok = ok and not errors
     return 0 if ok else 1
+
+
+def cmd_dns(args):
+    cfg = settings()
+    if "--plan" in args:
+        result = reconcile_records(cfg, ACTIVE, apply_changes=False)
+    else:
+        result = load_json(RECORDS_STATE)
+        if not result:
+            print("no dns/records result yet")
+            return 0
+        print(f"last run: {ago(time.time() - result['at'])}")
+    if result.get("note"):
+        print(result["note"])
+    for change in result.get("changes", []):
+        was = f" (was {change['was']})" if change.get("was") else ""
+        print(f"{change['action']:7} {change['name']} {change['type']} {change['value']}{was}: {change['state']}")
+    for conflict in result.get("conflicts", []):
+        print(f"CONFLICT {conflict}")
+    if result.get("error"):
+        print(f"ERROR {result['error']}")
+    if not (result.get("changes") or result.get("conflicts") or result.get("error") or result.get("note")):
+        print("in sync: nothing to change")
+    return 1 if result.get("error") or result.get("conflicts") else 0
 
 
 def cmd_version(_):
@@ -1209,7 +1440,7 @@ def cmd_version(_):
 
 
 COMMANDS = {"run": cmd_run, "status": cmd_status, "show": cmd_show, "checks": cmd_checks, "sync": cmd_sync,
-            "check": cmd_check, "--version": cmd_version, "version": cmd_version}
+            "check": cmd_check, "dns": cmd_dns, "--version": cmd_version, "version": cmd_version}
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] not in COMMANDS:

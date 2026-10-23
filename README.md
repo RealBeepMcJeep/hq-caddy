@@ -37,6 +37,7 @@ configuration at once, even if the Git server is down.
 ```
 sites/<name>.caddy   one site: https://<name>.<domain>
 tcp/<name>.caddy     one raw TCP forward
+dns/records          optional: DNS records under the domain (see below)
 ```
 
 A site is usually one line:
@@ -91,6 +92,33 @@ Every relay snippet sets or removes both relay headers (`X-Hq-Relay-Port`,
 `HQ_RELAY`, these sites answer 502 "relay not configured". The relay itself (trust
 only this proxy's IP, keep its `X-Forwarded-*`) runs on the other box.
 
+### DNS records (`dns/records`)
+
+With `HQ_DNS_RECORDS=true`, the proxy keeps the zone's records in line with this file,
+on every applied commit and again every `PROXY_CHECK_INTERVAL` (to repair drift):
+
+```
+# name    type   value          # note (stored in the record's comment)
+@         A      192.0.2.1      # the domain itself
+vpn       A      203.0.113.39   # VPN endpoint
+nas       A      192.0.2.28
+docs      CNAME  docs.example.net
+```
+
+- **Types:** A, AAAA and CNAME, always DNS-only (not proxied by Cloudflare), TTL auto.
+  Names are relative to `PROXY_DOMAIN`; `*.nas` style wildcards work.
+- **It only touches what it manages.** A record it creates gets a comment starting
+  with `hq-caddy records`; only records with that tag are ever updated or deleted.
+  Every other record in the zone is left alone.
+- **Adopting:** if a listed name already has a record with the listed value, it only
+  adds the tag. If it has a **different** value and no tag, nothing changes for that
+  name: the commit status shows the conflict until you remove that record or list
+  its value.
+- **Removing** a line deletes the tagged record. Without a `dns/records` file at all,
+  nothing is managed and nothing is deleted.
+- An invalid file rejects the commit, with the line named, like a broken site file.
+  `hq-caddy dns --plan` shows what it would change; `hq-caddy dns` shows the last result.
+
 ### Status checks
 
 One `# check:` line in a site or tcp file gives it a dot on the status page:
@@ -124,6 +152,7 @@ problem, or no result yet. Each entry is checked at most every
 | `PROXY_MANAGE_DNS` | `true`: create a missing `*.<host>.<domain>` A record for each `<service>.<host>` site (create-only, never edits or deletes) |
 | `PROXY_DNS_TARGET` | Address for those records (default: the first IPv4 `PROXY_BIND`) |
 | `PROXY_CHECK_INTERVAL` | Seconds between status checks of one entry (default 300, minimum 60) |
+| `HQ_DNS_RECORDS` | `true`: apply `dns/records` (needs the Cloudflare token with DNS edit) |
 | `HQ_RELAY` | `host:port` of a relay for loopback-only services on another box (`relay`, `relay_upstream`, `relay_files`, `relay_root`) |
 | `HQ_TLS` | `internal`: certificates from Caddy's local CA instead of Let's Encrypt (testing) |
 
@@ -154,7 +183,8 @@ Run them with `docker exec <container> hq-caddy <command>`.
 | `show` | Print the active Caddy configuration (no secrets) |
 | `checks` | List every status check result |
 | `sync` | Fetch and apply now instead of at the next poll (also retries a rejected commit) |
-| `check DIR` | Build and validate a checkout without applying it; names broken files |
+| `dns [--plan]` | The last `dns/records` result, or (`--plan`) the changes it would make now, applying nothing |
+| `check DIR` | Build and validate a checkout (site files and `dns/records`) without applying it; names broken files |
 | `--version` | hq-caddy and Caddy versions |
 
 ## Development
