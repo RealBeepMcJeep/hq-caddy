@@ -158,7 +158,8 @@ jobs:
 
       # The generator end to end: a local git repo as the config source, an upstream,
       # a TCP forward, a rejected commit (named file, old config keeps serving), a fix,
-      # status checks, and a clean stop. Certificates come from Caddy's local CA.
+      # dns/records against a stand-in Cloudflare API, status checks, and a clean stop.
+      # Certificates come from Caddy's local CA.
       - name: Self-test
         run: |
           # shellcheck disable=SC2016,SC2154  # wait_for evaluates its quoted condition; rc is set in the trap
@@ -182,6 +183,49 @@ jobs:
           http.server.HTTPServer(("127.0.0.1", 18997), Handler).serve_forever()
           EOF
           nohup python3 "$T/relay.py" > /dev/null 2>&1 &
+          # A stand-in Cloudflare API (zone example.test), seeded with records hq-caddy must not
+          # change: the wildcard, someone else's record, and a hand-made vpn record to adopt.
+          cat > "$T/fake_cf.py" <<'EOF'
+          import http.server, json, re, sys, urllib.parse, itertools
+          ids = itertools.count(100)
+          RECORDS = json.load(open(sys.argv[2]))
+          class H(http.server.BaseHTTPRequestHandler):
+              def reply(self, body, code=200):
+                  data = json.dumps(body).encode(); self.send_response(code); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(data)
+              def body(self):
+                  return json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+              def do_GET(self):
+                  u = urllib.parse.urlparse(self.path); q = urllib.parse.parse_qs(u.query)
+                  if u.path == "/zones":
+                      return self.reply({"success": True, "result": [{"id": "z1"}] if q.get("name") == [sys.argv[3]] else []})
+                  if u.path == "/zones/z1/dns_records":
+                      rs = [r for r in RECORDS if "name" not in q or r["name"] == q["name"][0]]
+                      return self.reply({"success": True, "result": rs, "result_info": {"total_pages": 1}})
+                  if u.path == "/dump":
+                      return self.reply(RECORDS)
+                  self.reply({"success": False}, 404)
+              def do_POST(self):
+                  b = self.body(); b["id"] = f"r{next(ids)}"
+                  if len(b.get("comment", "")) > 100:
+                      return self.reply({"success": False, "errors": [{"message": "comment too long"}]}, 400)
+                  RECORDS.append(b); self.reply({"success": True, "result": b})
+              def do_PATCH(self):
+                  rid = self.path.rsplit("/", 1)[1]; b = self.body()
+                  for r in RECORDS:
+                      if r["id"] == rid: r.update(b); return self.reply({"success": True, "result": r})
+                  self.reply({"success": False, "errors": [{"message": "no such record"}]}, 404)
+              def do_DELETE(self):
+                  rid = self.path.rsplit("/", 1)[1]
+                  RECORDS[:] = [r for r in RECORDS if r["id"] != rid]; self.reply({"success": True, "result": {"id": rid}})
+              def log_message(self, *a): pass
+          http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+          EOF
+          cat > "$T/zone.json" <<'EOF'
+          [{"id": "w1", "type": "A", "name": "*.example.test", "content": "127.0.0.1", "proxied": false, "comment": ""},
+           {"id": "x1", "type": "A", "name": "other.example.test", "content": "192.0.2.99", "proxied": false, "comment": "someone else's"},
+           {"id": "v1", "type": "A", "name": "vpn.example.test", "content": "203.0.113.39", "proxied": false, "comment": "by hand"}]
+          EOF
+          nohup python3 "$T/fake_cf.py" 18995 "$T/zone.json" example.test > /dev/null 2>&1 &
           git init -q --bare -b main "$T/config.git"; git clone -q "$T/config.git" "$T/work"
           commit() { git -C "$T/work" add -A; git -C "$T/work" -c user.name=ci -c user.email=ci@example.com commit -qm "$1"; git -C "$T/work" push -q origin main; }
           mkdir -p "$T/work/sites" "$T/work/tcp"
@@ -197,6 +241,7 @@ jobs:
           docker run -d --name hq --network host --user "$(id -u):$(id -g)" -e HOME=/data \
             -e PROXY_DOMAIN=example.test -e HQ_TLS=internal -e PROXY_BIND=127.0.0.1 \
             -e PROXY_HTTP_PORT=18080 -e PROXY_HTTPS_PORT=18443 -e HQ_POLL_SECONDS=3 -e HQ_RELAY=127.0.0.1:18997 \
+            -e HQ_DNS_RECORDS=true -e CLOUDFLARE_API_TOKEN=ci-dummy -e HQ_CLOUDFLARE_API=http://127.0.0.1:18995 \
             -e HQ_CONFIG_REPO=file:///config.git -v "$T/config.git:/config.git" -v "$T/data:/data" "$IMAGE:latest"
           get() { curl -sk -o /dev/null -w '%{http_code}' --resolve "$1.example.test:18443:127.0.0.1" "https://$1.example.test:18443$2"; }
           wait_for() { for _ in $(seq 1 40); do eval "$1" && return 0; sleep 1; done; echo "timed out: $1"; return 1; }
@@ -233,6 +278,26 @@ jobs:
           if page_has 'was rejected'; then
             echo "the rejection banner is still shown after the fix"; false
           fi
+          # dns/records: create and adopt; never touch other records.
+          zone() { curl -s http://127.0.0.1:18995/dump | jq -r '.[] | "\(.type) \(.name) \(.content) \(.comment)"' | sort; }
+          zone_has() { local out; out="$(zone)"; grep -qx "$1" <<< "$out"; }
+          mkdir -p "$T/work/dns"
+          printf 'vpn  A  203.0.113.39  # VPN\nnew  A  192.0.2.60\n' > "$T/work/dns/records"; commit "dns records"
+          wait_for 'zone_has "A new.example.test 192.0.2.60 hq-caddy records"'
+          zone_has 'A vpn.example.test 203.0.113.39 hq-caddy records: VPN'
+          zone_has "A other.example.test 192.0.2.99 someone else's"
+          zone_has 'A \*.example.test 127.0.0.1 '
+          docker exec hq hq-caddy dns
+          # An invalid records file rejects the commit (file and line named); the zone stays.
+          printf 'vpn  A  203.0.113.39  # VPN\nnew  MX  mail\n' > "$T/work/dns/records"; commit "bad dns"
+          wait_for 'status_has "REJECTED: .*dns/records: line 2: type MX not supported"'
+          zone_has 'A new.example.test 192.0.2.60 hq-caddy records'
+          # A record taken out of the file is deleted, since hq-caddy made it; the others remain.
+          printf 'vpn  A  203.0.113.39  # VPN\n' > "$T/work/dns/records"; commit "drop new"
+          wait_for '! zone_has "A new.example.test 192.0.2.60 hq-caddy records"'
+          zone_has "A other.example.test 192.0.2.99 someone else's"
+          zone_has 'A vpn.example.test 203.0.113.39 hq-caddy records: VPN'
+          [ "$(zone | wc -l)" = 3 ]
           # Status checks (the first round runs 15 s after start).
           wait_for 'curl -sk --resolve sites.example.test:18443:127.0.0.1 https://sites.example.test:18443/status.json | jq -e ".checks[\"site:upstream\"].state == \"up\" and .checks[\"tcp:echo\"].state == \"up\"" > /dev/null'
           docker exec hq hq-caddy checks
