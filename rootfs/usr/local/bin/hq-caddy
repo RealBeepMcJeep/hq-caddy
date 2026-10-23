@@ -73,7 +73,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 STATE = Path(os.environ.get("HQ_STATE_DIR", "/data/hq-caddy"))
 ACTIVE = STATE / "active"
 CANDIDATE = STATE / "candidate"
@@ -359,7 +359,7 @@ def reconcile_records(cfg, folder, apply_changes=True):
     elif apply_changes and not cfg["manage_records"]:
         result["note"] = "dns/records present, but HQ_DNS_RECORDS is off"
     elif not (cfg["public"] and token()):
-        result["error"] = "HQ_DNS_RECORDS needs PROXY_DOMAIN and a Cloudflare token"
+        result["error"] = "dns/records needs PROXY_DOMAIN and a Cloudflare token"
     else:
         wanted, errors = parse_records(path.read_text(), cfg["public"])
         with RECORDS_LOCK:
@@ -528,7 +528,7 @@ def build(target, cfg, source, sync):
     for name, content in pages(cfg, sites, skipped, tcp, sync).items():
         (target / "pages" / name).write_text(content)
     active = lambda item: dict(item, path=item["path"].replace(str(target), str(ACTIVE), 1))
-    return {"public": cfg["public"], "hosts": sorted(host_names), "sites": [active(s) for s in sites],
+    return {"version": VERSION, "public": cfg["public"], "hosts": sorted(host_names), "sites": [active(s) for s in sites],
             "skipped": skipped, "tcp": [active(t) for t in tcp]}
 
 
@@ -1314,6 +1314,10 @@ def cmd_run(_):
     if not (cfg["repo"] or cfg["config_dir"]):
         log("set HQ_CONFIG_REPO (or HQ_CONFIG_DIR); serving only the sites page until then")
     STATE.mkdir(parents=True, exist_ok=True)
+    if load_json(REPORT) and load_json(REPORT).get("version") != VERSION:
+        # The snapshot was built by another version, which may have copied less of the
+        # checkout (e.g. no dns/records): build the applied commit again on the first sync.
+        SYNC_NOW.touch()
     # Start from the last good snapshot so a restart serves at once, even with the repository down.
     ok, message = rebuild(cfg)
     if not ok:
