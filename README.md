@@ -117,7 +117,8 @@ docs      CNAME  docs.example.net
 - **Removing** a line deletes the tagged record. Without a `dns/records` file at all,
   nothing is managed and nothing is deleted.
 - An invalid file rejects the commit, with the line named, like a broken site file.
-  `hq-caddy dns --plan` shows what it would change; `hq-caddy dns` shows the last result.
+  `hq-caddy dns --plan` shows what it would change (also before `HQ_DNS_RECORDS` is on,
+  to preview a first run); `hq-caddy dns` shows the last result.
 
 ### Status checks
 

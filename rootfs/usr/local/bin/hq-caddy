@@ -48,7 +48,8 @@ Commands:
   show       print the active Caddy configuration
   checks     list every status check result
   sync       fetch and apply now instead of waiting for the next poll
-  dns        the last dns/records result (--plan: compute the changes now, apply nothing)
+  dns        the last dns/records result (--plan: compute the changes now, apply nothing;
+             works before HQ_DNS_RECORDS is turned on)
   check DIR  build and validate DIR (a checkout of the config repository) without applying
   --version  print the hq-caddy and Caddy versions
 """
@@ -355,7 +356,7 @@ def reconcile_records(cfg, folder, apply_changes=True):
     result = {"at": int(time.time()), "changes": [], "conflicts": [], "error": ""}
     if not path:
         result["note"] = "no dns/records file: no records managed"
-    elif not cfg["manage_records"]:
+    elif apply_changes and not cfg["manage_records"]:
         result["note"] = "dns/records present, but HQ_DNS_RECORDS is off"
     elif not (cfg["public"] and token()):
         result["error"] = "HQ_DNS_RECORDS needs PROXY_DOMAIN and a Cloudflare token"
