@@ -73,7 +73,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 STATE = Path(os.environ.get("HQ_STATE_DIR", "/data/hq-caddy"))
 ACTIVE = STATE / "active"
 CANDIDATE = STATE / "candidate"
@@ -1318,6 +1318,9 @@ def cmd_run(_):
         # The snapshot was built by another version, which may have copied less of the
         # checkout (e.g. no dns/records): build the applied commit again on the first sync.
         SYNC_NOW.touch()
+    # Apply dns/records in the first check round, so changed settings (e.g. HQ_DNS_RECORDS
+    # just turned on) take effect without a new commit.
+    RECORDS_STATE.unlink(missing_ok=True)
     # Start from the last good snapshot so a restart serves at once, even with the repository down.
     ok, message = rebuild(cfg)
     if not ok:
