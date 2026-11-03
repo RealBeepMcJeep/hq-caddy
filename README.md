@@ -157,6 +157,12 @@ problem, or no result yet. Each entry is checked at most every
 | `HQ_RELAY` | `host:port` of a relay for loopback-only services on another box (`relay`, `relay_upstream`, `relay_files`, `relay_root`) |
 | `HQ_TLS` | `internal`: certificates from Caddy's local CA instead of Let's Encrypt (testing) |
 
+Certificates come from Let's Encrypt through Cloudflare DNS-01 challenges. The proxy
+doesn't check propagation itself: it waits 60 s after publishing the challenge record,
+then lets Let's Encrypt validate. Many LANs redirect outgoing DNS (port 53) to a local
+resolver that caches the "no record yet" answer, so a local check would time out on
+every issuance. Only Let's Encrypt is used; there is no ZeroSSL fallback.
+
 Point a DNS-only wildcard `*.<domain>` at the proxy's address. A host that has
 its own record (e.g. `nas.<domain>`) also needs `*.nas.<domain>` for
 `<service>.nas` names; `PROXY_MANAGE_DNS` creates those. Any `*.<host>` record
