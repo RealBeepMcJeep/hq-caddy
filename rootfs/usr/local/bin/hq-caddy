@@ -446,7 +446,11 @@ def caddyfile(cfg, sites, tcp, host_names, target):
     if cfg["tls_internal"]:
         out.append("\tlocal_certs")
     elif token():
-        out.append("\tacme_dns cloudflare {env.CLOUDFLARE_API_TOKEN}")
+        # No DNS-01 propagation check: it queries the zone's nameservers on port 53, and LANs
+        # that redirect outbound DNS answer it from a cache that keeps the "no TXT" result, so
+        # every issuance times out. Cloudflare publishes within seconds; wait, then let the CA check.
+        out += ["\tcert_issuer acme {", "\t\tdns cloudflare {env.CLOUDFLARE_API_TOKEN}",
+                "\t\tpropagation_delay 60s", "\t\tpropagation_timeout -1", "\t}"]
     if tcp:
         out.append("\tlayer4 {")
         out += [f"\t\timport {quote(item['path'])}" for item in tcp]
