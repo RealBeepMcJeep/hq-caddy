@@ -21,8 +21,28 @@ latest_git_tag() {
 # tags it has cached, so a brand-new release can appear a few hours later.
 repository=library/caddy
 tags=$(curl -fsSL --retry 3 "https://mirror.gcr.io/v2/$repository/tags/list" | jq -er '.tags[]')
-caddy_version=$(grep -E '^[0-9]+\.[0-9]+\.[0-9]+-builder$' <<< "$tags" | sed 's/-builder$//' | sort -V |
-  while read -r version; do grep -qx "$version-alpine" <<< "$tags" && echo "$version"; done | tail -n 1)
+platforms() {
+  # os/arch entries of a tag's image index, one per line.
+  curl -fsSL --retry 3 \
+    -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
+    "https://mirror.gcr.io/v2/$repository/manifests/$1" | jq -r '.manifests[]?.platform | "\(.os)/\(.architecture)"'
+}
+complete() {
+  # The mirror can list a new tag before it holds every platform (a build then fails
+  # with "no match for platform in manifest"): the builder must have amd64 (CI builds
+  # on amd64), the runtime image amd64 and arm64.
+  local builder runtime
+  builder=$(platforms "$1-builder") && runtime=$(platforms "$1-alpine") || return 1
+  grep -qx linux/amd64 <<< "$builder" && grep -qx linux/amd64 <<< "$runtime" && grep -qx linux/arm64 <<< "$runtime"
+}
+# The newest release whose builder and alpine images are both fully mirrored.
+caddy_version=""
+mapfile -t releases < <(grep -E '^[0-9]+\.[0-9]+\.[0-9]+-builder$' <<< "$tags" | sed 's/-builder$//' | sort -rV)
+for version in "${releases[@]}"; do
+  grep -qx "$version-alpine" <<< "$tags" || continue
+  if complete "$version"; then caddy_version=$version; break; fi
+  echo "probe: caddy $version not fully mirrored yet; trying the previous release" >&2
+done
 digest() {
   # Fails (and so stops the probe) unless the registry returns a sha256 digest.
   curl -fsSI --retry 3 \
