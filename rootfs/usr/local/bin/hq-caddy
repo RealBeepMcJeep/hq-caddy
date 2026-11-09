@@ -19,6 +19,7 @@ Settings (environment):
   HQ_POLL_SECONDS            seconds between fetches (default 30, min 5)
   HQ_STATUS_CONTEXT          name of the commit status (default hq-caddy)
   HQ_TLS                     "internal": certificates from Caddy's local CA (tests)
+  HQ_ENCODE                  response compression for every site (default "zstd gzip"; "off" disables)
   HQ_RELAY                   host:port of a relay for services that listen only on
                              loopback on another box (see `relay` below)
   PROXY_BIND                 addresses to listen on, comma/space separated (default all)
@@ -73,7 +74,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-VERSION = "0.3.3"
+VERSION = "0.4.0"
 STATE = Path(os.environ.get("HQ_STATE_DIR", "/data/hq-caddy"))
 ACTIVE = STATE / "active"
 CANDIDATE = STATE / "candidate"
@@ -118,6 +119,10 @@ def settings():
         "repo_token_file": env("HQ_CONFIG_TOKEN_FILE"),
         "config_dir": env("HQ_CONFIG_DIR"),
         "relay": env("HQ_RELAY"),
+        # Caddy compresses only text-like types, skips small and already-compressed
+        # responses and partial (Range) answers, flushes streams, and leaves WebSockets alone.
+        "encode": "" if env("HQ_ENCODE", "zstd gzip").lower() in ("", "off", "none", "false", "0")
+                  else " ".join(f for f in env("HQ_ENCODE", "zstd gzip").lower().split() if f in ("zstd", "gzip", "br")),
         "poll": number("HQ_POLL_SECONDS", 30, 5),
         "check_interval": number("PROXY_CHECK_INTERVAL", 300, 60),
         "manage_dns": env("PROXY_MANAGE_DNS").lower() in ("1", "true", "yes", "on"),
@@ -460,7 +465,8 @@ def caddyfile(cfg, sites, tcp, host_names, target):
             "\t\t}", "\t\tformat json", "\t}", "}", ""]
 
     # (site NAME { directives }) and (proxy NAME UPSTREAM), as in site files.
-    out += ["(site) {", f"\t{{args[0]}}.{public} {{", "\t\t{block}", "\t}", "}", "",
+    out += ["(site) {", f"\t{{args[0]}}.{public} {{"] + ([f"\t\tencode {cfg['encode']}"] if cfg["encode"] else []) + [
+            "\t\t{block}", "\t}", "}", "",
             "# import proxy NAME UPSTREAM", "(proxy) {", "\timport site {args[0]} {",
             "\t\treverse_proxy {args[1]}", "\t}", "}", ""]
     # A relay on another box reaches its loopback-only services: the port travels in a
