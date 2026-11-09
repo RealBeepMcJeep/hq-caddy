@@ -120,6 +120,13 @@ docs      CNAME  docs.example.net
   `hq-caddy dns --plan` shows what it would change (also before `HQ_DNS_RECORDS` is on,
   to preview a first run); `hq-caddy dns` shows the last result.
 
+### Compression
+
+Every site compresses its responses (`encode zstd gzip`) unless `HQ_ENCODE=off`. Caddy
+compresses only text-like types (HTML, JS, CSS, JSON, …), skips small responses, ones
+the upstream already compressed and partial (`Range`) answers, flushes streams such as
+server-sent events as they arrive, and leaves WebSockets alone.
+
 ### Status checks
 
 One `# check:` line in a site or tcp file gives it a dot on the status page:
@@ -154,6 +161,7 @@ problem, or no result yet. Each entry is checked at most every
 | `PROXY_DNS_TARGET` | Address for those records (default: the first IPv4 `PROXY_BIND`) |
 | `PROXY_CHECK_INTERVAL` | Seconds between status checks of one entry (default 300, minimum 60) |
 | `HQ_DNS_RECORDS` | `true`: apply `dns/records` (needs the Cloudflare token with DNS edit) |
+| `HQ_ENCODE` | Response compression for every site: `zstd gzip` (default) or `off` |
 | `HQ_RELAY` | `host:port` of a relay for loopback-only services on another box (`relay`, `relay_upstream`, `relay_files`, `relay_root`) |
 | `HQ_TLS` | `internal`: certificates from Caddy's local CA instead of Let's Encrypt (testing) |
 

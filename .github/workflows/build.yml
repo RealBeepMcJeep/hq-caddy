@@ -166,7 +166,7 @@ jobs:
           set -Eeuo pipefail
           annotate() { local text; text="$(cat)"; text="${text//'%'/'%25'}"; echo "::error title=$1::${text//$'\n'/'%0A'}"; }
           trap 'rc=$?; trap - ERR; { echo "command: $BASH_COMMAND (exit $rc)"; docker exec hq hq-caddy status || true; docker logs hq 2>&1 | tail -n 30; } 2>&1 | annotate self-test' ERR
-          T=/tmp/selftest; mkdir -p "$T/up" "$T/data"; echo upstream-ok > "$T/up/marker.txt"
+          T=/tmp/selftest; mkdir -p "$T/up" "$T/data"; echo upstream-ok > "$T/up/marker.txt"; python3 -c 'print("compressible " * 5000)' > "$T/up/big.txt"
           (cd "$T/up" && nohup python3 -m http.server 18999 --bind 127.0.0.1 > /dev/null 2>&1 &)
           # A stand-in relay: answers with the port header it received ("files" without one).
           cat > "$T/relay.py" <<'EOF'
@@ -252,6 +252,10 @@ jobs:
           wait_for '[ "$(get upstream /marker.txt)" = 200 ]'
           [ "$(get sites /)" = 200 ]
           [ "$(get hello.demo /marker.txt)" = 200 ]
+          # Responses are compressed by default (HQ_ENCODE); content is unchanged once decoded.
+          encoding="$(curl -sk -o /dev/null -D - -H 'Accept-Encoding: zstd, gzip' --resolve upstream.example.test:18443:127.0.0.1 https://upstream.example.test:18443/big.txt | tr -d '\r' | awk -F': ' 'tolower($1) == "content-encoding" { print $2 }')"
+          [ "$encoding" = zstd ] || [ "$encoding" = gzip ]
+          [ "$(curl -sk --compressed --resolve upstream.example.test:18443:127.0.0.1 https://upstream.example.test:18443/big.txt | wc -c)" = "$(wc -c < "$T/up/big.txt")" ]
           [ "$(get nothing.demo /)" = 404 ]
           [ "$(get no-such-site /)" = 404 ]
           [ "$(curl -s -m 5 http://127.0.0.1:18022/marker.txt)" = upstream-ok ]
