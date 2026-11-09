@@ -56,6 +56,8 @@ import site api {
 }
 ```
 
+- **Compression:** every site compresses text responses (Caddy's `encode` defaults: zstd, then
+  gzip; responses an upstream already compressed pass through). Don't add `encode` in a site file.
 - **Names:** `a-z`, `0-9` and `-`, with dots for `<service>.<host>`
   (e.g. `dockge.nas`). Each host gets one wildcard certificate,
   `*.<host>.<domain>`, so new services on it need no new certificate.

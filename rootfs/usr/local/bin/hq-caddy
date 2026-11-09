@@ -459,8 +459,10 @@ def caddyfile(cfg, sites, tcp, host_names, target):
             "\tlog file {", f"\t\toutput file {quote(LOG)} {{", "\t\t\troll_size 5MiB", "\t\t\troll_keep 3",
             "\t\t}", "\t\tformat json", "\t}", "}", ""]
 
-    # (site NAME { directives }) and (proxy NAME UPSTREAM), as in site files.
-    out += ["(site) {", f"\t{{args[0]}}.{public} {{", "\t\t{block}", "\t}", "}", "",
+    # (site NAME { directives }) and (proxy NAME UPSTREAM), as in site files. Every site compresses
+    # text responses (Caddy's encode defaults: zstd, then gzip); encode passes through responses an
+    # upstream already compressed, streams server-sent events, and leaves WebSockets alone.
+    out += ["(site) {", f"\t{{args[0]}}.{public} {{", "\t\tencode", "\t\t{block}", "\t}", "}", "",
             "# import proxy NAME UPSTREAM", "(proxy) {", "\timport site {args[0]} {",
             "\t\treverse_proxy {args[1]}", "\t}", "}", ""]
     # A relay on another box reaches its loopback-only services: the port travels in a
